@@ -1,0 +1,46 @@
+# ── 환경 변수 / 시크릿 (API 키 포함 — 절대 커밋 금지) ──
+.env
+.env.*
+!.env.example
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── 가상환경 / UV ──
+.venv/
+venv/
+env/
+.uv/
+# uv.lock 은 의존성 고정용 — 커밋 권장 (제외하지 않음)
+
+# ── 테스트 / 커버리지 / 타입체크 캐시 ──
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── IDE / 에디터 ──
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── 로그 / 임시 ──
+*.log
+tmp/
+
+# ── 수집 결과물 (재생성 가능 + raw 응답에 OC 키 포함) ──
+output/
