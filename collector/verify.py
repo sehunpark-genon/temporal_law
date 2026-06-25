@@ -6,7 +6,7 @@
 방법:
   1) 법제처 본문 페이지를 Chrome 으로 렌더링(= 사용자가 브라우저에서 보는 그대로)
      해서 본문 앵커(하이퍼링크)를 전부 추출한다. 이게 'ground truth'.
-  2) main.py 가 만든 payload(relations + ordinance_delegations) 와 대조한다.
+  2) 수집 코어가 만든 payload(relations + ordinance_delegations) 와 대조한다.
   3) 카테고리별로 빠진 링크가 있는지 리포트한다.
   4) 캡처한 target_url 들이 실제로 살아있는 주소인지 표본 검증한다.
 
@@ -24,8 +24,8 @@ import json
 
 import requests
 
-import lawgo_render as R
-from main import OUTPUT_DIR, build_ref_url
+from collector import render as R
+from collector.core import OUTPUT_DIR, build_ref_url
 
 
 def load_payloads() -> list[dict]:
@@ -58,22 +58,22 @@ def render_ground_truth(law: dict) -> dict:
         "internal_jo_links": 0,          # 조문 네비게이션 링크 수
     }
 
-    for a in anchors:
+    for a in anchors:                            # 렌더링 앵커를 카테고리별로 집계
         cat = a["category"]
         if cat == "법령참조":
-            if a.get("ref_kind") == "external":
+            if a.get("ref_kind") == "external":  # 「OO법」 = 외부 법령 인용
                 m = re.match(r"「([^」]+)」", a["text"])
                 if m:
                     gt["external_law_names"].add(m.group(1).strip())
-            else:
+            else:                                # 제N조만 = 본문 내 조문 네비게이션
                 gt["internal_jo_links"] += 1
-        elif cat == "행정규칙":
+        elif cat == "행정규칙":                   # 출처조문 단위로 대표 앵커 보관(나중 실조회용)
             if a.get("source_article_no"):
                 gt["admrul_anchors"].setdefault(a["source_article_no"], a)
         elif cat == "자치법규":
             if a.get("source_article_no"):
                 gt["ordin_anchors"].setdefault(a["source_article_no"], a)
-        elif cat == "학칙공단":
+        elif cat == "학칙공단":                   # 정관 등은 팝업 조회로 제목 해석
             title = R.resolve_schlpub_title(a)
             if title:
                 gt["schlpub_titles"].add(title)

@@ -45,11 +45,12 @@ DATCLS_MAP = {
 
 
 def find_chrome() -> str | None:
-    for path in CHROME_CANDIDATES:
+    """설치된 Chrome/Chromium/Edge 실행 경로를 찾는다. 없으면 None."""
+    for path in CHROME_CANDIDATES:                # 맥 앱 기본 경로 우선
         if path and shutil.which(path) or (path and _exists(path)):
             return path
     for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-        found = shutil.which(name)
+        found = shutil.which(name)                # PATH 에서 탐색(리눅스 등)
         if found:
             return found
     return None
@@ -71,6 +72,7 @@ def render_law_dom(mst: str, ef_yd: str = "", virtual_time_ms: int = 20000,
         print("[WARN] Chrome 을 찾지 못해 본문 렌더링(정관/커버리지)을 건너뜀.")
         return ""
 
+    # 본문 페이지 URL (이 페이지가 JS 로 조문/링크를 그린다)
     url = (
         f"{LSW}/lsInfoP.do?lsiSeq={mst}"
         f"&efYd={ef_yd}&ancYnChk=1&urlMode=lsInfoP&gubun=api"
@@ -78,14 +80,14 @@ def render_law_dom(mst: str, ef_yd: str = "", virtual_time_ms: int = 20000,
 
     cmd = [
         chrome,
-        "--headless=new",
+        "--headless=new",                                   # 화면 없이 실행
         "--disable-gpu",
         "--no-sandbox",
         "--hide-scrollbars",
         "--disable-dev-shm-usage",
-        f"--virtual-time-budget={virtual_time_ms}",
+        f"--virtual-time-budget={virtual_time_ms}",         # JS 실행을 이 시간만큼 기다림
         "--run-all-compositor-stages-before-draw",
-        "--dump-dom",
+        "--dump-dom",                                       # JS 실행 끝난 최종 DOM 을 stdout 으로
         url,
     ]
 
@@ -109,10 +111,12 @@ def render_law_dom(mst: str, ef_yd: str = "", virtual_time_ms: int = 20000,
 # 앵커 추출
 # =========================
 
+# 본문의 onclick 링크 하나하나: group(1)=onclick 본문, group(2)=화면에 보이는 텍스트
 _ANCHOR_RE = re.compile(
     r'<a\b[^>]*onclick="javascript:([^"]*)"[^>]*>(.*?)</a>', re.S
 )
 
+# onclick 함수별 인자 파서 (어떤 종류의 링크인지 + 파라미터 추출)
 _FN_RES = {
     "fncLsLawPop": re.compile(r"fncLsLawPop\('([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\)"),
     "fncLsPttnLinkPop": re.compile(r"fncLsPttnLinkPop\('([^']*)'\)"),
@@ -152,20 +156,21 @@ def extract_body_anchors(dom: str) -> list[dict]:
     if not dom:
         return anchors
 
-    for m in _ANCHOR_RE.finditer(dom):
+    for m in _ANCHOR_RE.finditer(dom):           # 본문 모든 onclick 링크 순회
         onclick = m.group(1)
-        text = _strip_tags(m.group(2))
+        text = _strip_tags(m.group(2))           # 앵커 표시 텍스트(태그 제거)
         if not text:
             continue
 
         rec = {"text": text, "onclick": onclick}
 
+        # onclick 함수 종류로 링크 분류 (먼저 매칭되는 것 채택)
         law = _FN_RES["fncLsLawPop"].search(onclick)
         pttn = _FN_RES["fncLsPttnLinkPop"].search(onclick)
         deleg = _FN_RES["joDelegatePop"].search(onclick)
         ordin = _FN_RES["joDelegateOrdinPop"].search(onclick)
 
-        if law:
+        if law:                                  # 법령/조문 참조 링크
             rec.update(fn="fncLsLawPop", category="법령참조",
                        ls_id=law.group(1), scope=law.group(2))
             # 「OO법」 형태면 외부 법령 인용, '제N조/제N항' 이면 자기 조문 내부참조

@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-import lawgo_render
+from collector import render
 
 
 # =========================
@@ -72,26 +72,26 @@ def get_json(url: str, params: dict, sleep_sec: float = 0.2):
     법제처 API 호출 공통 함수.
     PoC라서 단순 retry만 넣음.
     """
-    for attempt in range(3):
+    for attempt in range(3):                      # 최대 3회 재시도
         try:
             res = requests.get(url, params=params, timeout=30)
             res.raise_for_status()
 
             text = res.text.strip()
-            if not text:
+            if not text:                          # 빈 응답이면 None
                 return None
 
             return res.json()
 
         except Exception as e:
-            if attempt == 2:
+            if attempt == 2:                      # 마지막 시도까지 실패 → 포기
                 print(f"[ERROR] API 실패: {url} params={params} err={e}")
                 return None
 
-            time.sleep(1)
+            time.sleep(1)                         # 재시도 전 대기
 
         finally:
-            time.sleep(sleep_sec)
+            time.sleep(sleep_sec)                 # 호출 간 최소 간격(과호출 방지)
 
 
 def normalize_text(text: str) -> str:
@@ -156,6 +156,16 @@ def listify(value):
     if isinstance(value, list):
         return value
     return [value]
+
+
+def flatten_text(value) -> str:
+    """문자열/중첩 리스트를 공백으로 이어붙인 한 줄 텍스트로.
+    (목내용 등이 법령에 따라 문자열·리스트·리스트의 리스트로 와서 방어 처리)"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " ".join(flatten_text(v) for v in value)
+    return str(value)
 
 
 # =========================
@@ -363,16 +373,16 @@ def extract_article_text(jo: dict) -> str:
     (이전 PoC는 '조내용' 키를 찾았지만 본문 JSON은 '조문내용/항내용/호내용/목내용'
      체계라서 본문이 비어있었음. 여기서 정상화.)
     """
-    parts = []
+    parts = []                                   # 조문 텍스트 조각 누적
 
     if not isinstance(jo, dict):
         return ""
 
-    head = normalize_text(jo.get("조문내용", ""))
+    head = normalize_text(jo.get("조문내용", ""))  # 조 제목/머리글 (예: "제2조(정의) …")
     if head:
         parts.append(head)
 
-    for hang in listify(jo.get("항")):
+    for hang in listify(jo.get("항")):            # 항(①②…) 순회
         if not isinstance(hang, dict):
             continue
 
@@ -380,7 +390,7 @@ def extract_article_text(jo: dict) -> str:
         if hang_text:
             parts.append(hang_text)
 
-        for ho in listify(hang.get("호")):
+        for ho in listify(hang.get("호")):        # 호(1.2.…) 순회
             if not isinstance(ho, dict):
                 continue
 
@@ -388,16 +398,15 @@ def extract_article_text(jo: dict) -> str:
             if ho_text:
                 parts.append(ho_text)
 
-            for mok in listify(ho.get("목")):
+            for mok in listify(ho.get("목")):     # 목(가.나.…) 순회
                 if not isinstance(mok, dict):
                     continue
-                mok_content = mok.get("목내용", "")
-                # 목내용은 가끔 리스트로 옴
-                mok_text = normalize_text(" ".join(listify(mok_content)))
+                # 목내용은 문자열/리스트/리스트의 리스트로 옴 → 평탄화해서 한 줄로
+                mok_text = normalize_text(flatten_text(mok.get("목내용", "")))
                 if mok_text:
                     parts.append(mok_text)
 
-    return "\n".join(parts)
+    return "\n".join(parts)                       # 조문 내 줄들을 \n 으로
 
 
 def build_body_text(body_json: dict) -> str:
@@ -663,7 +672,7 @@ def iter_citation_lines(body_json: dict):
                     yield art, clause, hot
                 for mok in listify(ho.get("목")):
                     if isinstance(mok, dict):
-                        mt = normalize_text(" ".join(listify(mok.get("목내용", ""))))
+                        mt = normalize_text(flatten_text(mok.get("목내용", "")))
                         if mt:
                             yield art, clause, mt
 
@@ -884,14 +893,15 @@ def dedupe_relations(relations: list[dict]) -> list[dict]:
 # =========================
 
 def build_payload(law_name: str) -> dict:
+    """법령 1건의 전체 payload 조립 (수집 코어의 진입점)."""
     print(f"\n[START] {law_name}")
 
-    law_meta = search_law(law_name)
+    law_meta = search_law(law_name)               # ① 검색: MST·ID·날짜 등 메타
 
-    body_json = fetch_law_body(law_meta, law_name)
-    delegated_json = fetch_delegated(law_meta, law_name)
+    body_json = fetch_law_body(law_meta, law_name)        # ② 본문 (JSON)
+    delegated_json = fetch_delegated(law_meta, law_name)  # ③ 위임링크 (lsDelegated)
 
-    body_text = build_body_text(body_json)
+    body_text = build_body_text(body_json)        # ④ 본문 → 조문 순서 텍스트
 
     law_id = (
         law_meta.get("ID")
@@ -939,13 +949,15 @@ def build_payload(law_name: str) -> dict:
         or ""
     )
 
+    # ⑤ 관계 추출: 위임(API) + 인용/자기참조(텍스트) + 정관(렌더링)
     delegation_relations = build_delegation_relations(delegated_json)
     citation_relations = build_citation_relations(body_json, self_law_name=law_name)
 
     # 학칙공단(정관 등): lsDelegated 에 안 잡히므로 본문 렌더링으로 보강
-    dom = lawgo_render.render_law_dom(str(mst), str(enforcement_date))
-    schlpub_relations = lawgo_render.build_schlpub_relations(dom, build_ref_url)
+    dom = render.render_law_dom(str(mst), str(enforcement_date))
+    schlpub_relations = render.build_schlpub_relations(dom, build_ref_url)
 
+    # ⑥ 합치고 중복 제거(같은 출처조문→같은 대상조문은 1건)
     all_relations = dedupe_relations(
         delegation_relations + citation_relations + schlpub_relations
     )

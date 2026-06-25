@@ -1,0 +1,67 @@
+# 인프라 스택
+#   temporal-db   : Temporal 영속화 전용 Postgres (내부)
+#   temporal      : Temporal 서버           (gRPC 7233)
+#   temporal-ui   : Web UI                  (http://localhost:8080)
+#   lawdb         : 앱 데이터 전용 Postgres  (AI팀이 읽는 DB, localhost:5544)
+#
+# 깨끗한 새 머신:   docker compose up -d            (전체)
+# 이미 Temporal 이 떠 있으면(이 PC): docker compose up -d lawdb   (앱 DB만)
+# 이미지 태그 안 맞으면 버전만 조정.
+
+services:
+  temporal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes:
+      - temporal_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      temporal-db:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-db
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8080:8080"
+
+  # ── 앱 데이터 전용 DB (수집 결과 적재처) ──
+  lawdb:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lawuser
+      POSTGRES_PASSWORD: lawpass
+      POSTGRES_DB: lawdb
+    ports:
+      - "5544:5432"
+    volumes:
+      - lawdb_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lawuser -d lawdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  temporal_pgdata:
+  lawdb_pgdata:
