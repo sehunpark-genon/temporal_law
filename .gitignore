@@ -52,3 +52,6 @@ output/
 docs/COMMANDS.md
 docs/MIRRORING.md
 docs/INTERNALS.md
+
+# 조사보고는 로컬 보관
+docs/조사보고.md
