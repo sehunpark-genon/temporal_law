@@ -44,3 +44,11 @@ tmp/
 
 # ── 수집 결과물 (재생성 가능 + raw 응답에 OC 키 포함) ──
 output/
+
+# ── 루트로 export 된 법령 JSON (psql 추출물 등) ──
+/*.json
+
+# ── 저장소에서 제외하는 작업노트 문서 (디스크엔 보관) ──
+docs/COMMANDS.md
+docs/MIRRORING.md
+docs/INTERNALS.md

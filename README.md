@@ -7,10 +7,7 @@
 |---|---|
 | **[docs/OVERVIEW.md](docs/OVERVIEW.md)** | 전체 단계별 흐름 (보고용, 그림 위주) — *여기부터* |
 | **[docs/COLLECTION.md](docs/COLLECTION.md)** | 본문·하이퍼링크를 어떻게 뽑나 + 결과(payload) 형식 |
-| **[docs/INTERNALS.md](docs/INTERNALS.md)** | 한 법령이 payload 되기까지 — 함수별 상세 |
 | **[docs/PIPELINE.md](docs/PIPELINE.md)** | Temporal 자동화 + DB 스키마 + 실행 방법 |
-| **[docs/COMMANDS.md](docs/COMMANDS.md)** | 명령어 모음 (워커·스케줄·docker·DB·payload 조회) |
-| **[docs/MIRRORING.md](docs/MIRRORING.md)** | (검토용) 사이트 통째 미러링 시 예상 문제점 |
 
 ## 빠른 실행
 ```bash
