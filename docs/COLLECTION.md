@@ -7,8 +7,8 @@
 
 단발 실행:
 ```bash
-python3 -m collector.core     # 본문 + 하이퍼링크 수집 → output/
-python3 -m collector.verify   # "본문의 모든 링크를 다 가져왔나" 검증 리포트
+uv run python -m collector.core     # 본문 + 하이퍼링크 수집 → output/
+uv run python -m collector.verify   # "본문의 모든 링크를 다 가져왔나" 검증 리포트
 ```
 > 정관/학칙 추출과 커버리지 검증은 로컬에 설치된 **Chrome** 을 headless 로 사용한다. 없으면 정관만 건너뛰고 나머지는 정상 동작.
 

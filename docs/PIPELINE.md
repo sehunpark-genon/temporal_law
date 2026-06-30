@@ -16,26 +16,29 @@ collector/            ← 수집 코어 (pipeline 이 이걸 호출)
 
 pipeline/             ← 적재 자동화 (Temporal). collector 를 사용
   config.py           .env 설정 + 카탈로그 옵션(법률만/배치크기)
-  collect.py          어댑터: list_catalog(전체목록)·discover_versions(MST지문)·collect_payload·content_hash
-  db.py               Postgres 스키마 + upsert (law_catalog / collect_state / law / law_relation / sync_history)
+  collect.py          어댑터: discover_catalog(전체목록+지문)·collect_payload·content_hash
+  models.py           ORM 엔티티 (SQLAlchemy 2.0) — law_catalog / collect_state / law / law_relation / sync_history
+  db.py               저장 계층(Repository): 엔진(커넥션 풀) + upsert/조회 함수
   activities.py       I/O(목록·네트워크·Chrome·DB)를 Temporal Activity 로 격리
   workflows.py        오케스트레이션 (워크플로 4개)
   worker.py           워커
   starter.py          CLI: discover / backfill / sync-now / schedule / unschedule
 
+pyproject.toml        의존성/프로젝트 정의 (uv) · uv.lock 로 버전 고정
 docker-compose.yml    temporal-db · temporal · temporal-ui · lawdb
 ```
 **의존 방향**: `pipeline` → `pipeline.collect` → `collector.core` → `collector.render`.
+**DB 계층**: `models.py`(@Entity 격) + `db.py`(Repository 격). SQLAlchemy 2.0 ORM, 엔진에 커넥션 풀 내장. `init_schema()` 가 `models.Base` 기준으로 테이블/인덱스 생성(없을 때만).
 
 ---
 
 ## 2. 워크플로 (4개)
 
 ```
-DiscoverCatalogWorkflow(law_only)     전체 목록 조회 → law_catalog 적재 (신규는 처리대기 등록)
-CollectLawWorkflow(law_name, law_id)  공용 단위: 한 법령 [버전조회→수집→저장] (멱등)
-├─ BackfillWorkflow(only_unfinished, limit)  카탈로그 기준 배치 수집 (초기적재 & 재처리)
-└─ SyncWorkflow()                     (스케줄) 카탈로그 전체 MST 지문 비교 → 바뀐 것만 재수집
+DiscoverCatalogWorkflow(law_only)            전체 목록 조회 → law_catalog 적재 (신규는 처리대기 등록)
+CollectLawWorkflow(law_name, law_id, sig)    공용 단위: 한 법령 [수집→저장] (멱등)
+├─ BackfillWorkflow(limit)                   카탈로그 기준 배치 수집 (초기적재 & 재처리, limit 생략=전체)
+└─ SyncWorkflow()                            (스케줄) 카탈로그 전체 MST 지문 비교 → 바뀐 것만 재수집
 ```
 - 실제 I/O 는 전부 **activity** 로 격리(워크플로는 결정적이어야 함). activity 는 워커가 ThreadPoolExecutor 로 실행.
 - **데이터 흐름**: `discover`(목록) → `law_catalog` → `backfill`(법령별 수집) → `law`/`law_relation`, 이후 `sync`(매일 변경분만).
@@ -54,8 +57,8 @@ CollectLawWorkflow(law_name, law_id)  공용 단위: 한 법령 [버전조회→
 
 ## 4. 변경 감지 (MST 지문)
 
-- `discover_versions` 가 **법령 + 시행령 + 시행규칙의 MST** 를 `lawSearch` 한 번으로 모아 **지문(signature)** 생성.
-- `sync` 가 `collect_state` 의 지문과 비교 → 다르면 재수집, 같으면 `last_checked_at` 만 갱신.
+- `discover_catalog` 가 전체 목록을 받을 때 **법령 + 시행령 + 시행규칙의 MST** 를 묶어 `_signature_for` 로 **지문(signature)** 생성 → `law_catalog.version_signature` 에 저장.
+- `sync` 가 catalog 의 최신 지문과 `collect_state` 의 마지막 수집 지문을 비교 → 다르면 재수집.
 - `content_hash`(payload 내용 SHA-256)는 별개로, 수집 후 **내용이 같으면 DB 쓰기를 스킵**하는 보조 값.
 
 ---
@@ -139,17 +142,20 @@ DATABASE_URL=postgresql://lawuser:lawpass@localhost:5544/lawdb
 
 ### 6-2. 순서
 ```bash
+# 의존성 (uv.lock 기준 .venv 동기화)
+uv sync
+
 # 인프라
 docker compose up -d            # 새 머신은 전체 / 이 PC는: docker compose up -d lawdb
 
 # 워커 상주 (터미널 1, 정관 Chrome 사용)
-python3 -m pipeline.worker
+uv run python -m pipeline.worker
 
 # 적재 (터미널 2)
-python3 -m pipeline.starter discover    # ① 전체 목록 → law_catalog (법률 1,714건; 'discover all' = 전체)
-python3 -m pipeline.starter backfill     # ② 미처리/실패 법령 수집 (몇 번 돌려도 안 끝난 것만 이어받음)
-python3 -m pipeline.starter backfill 5   #    테스트: 5건만
-python3 -m pipeline.starter schedule     # ③ 매일 자동 sync 등록 (sync-now / unschedule 도 있음)
+uv run python -m pipeline.starter discover    # ① 전체 목록 → law_catalog (법률 1,714건; 'discover all' = 전체)
+uv run python -m pipeline.starter backfill     # ② 미처리/실패 법령 수집 (몇 번 돌려도 안 끝난 것만 이어받음)
+uv run python -m pipeline.starter backfill 5   #    테스트: 5건만
+uv run python -m pipeline.starter schedule     # ③ 매일 자동 sync 등록 (sync-now / unschedule 도 있음)
 ```
 
 --

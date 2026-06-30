@@ -1,109 +1,42 @@
 """
-Postgres 저장 계층 (모든 키는 law_id 기준).
+Postgres 저장 계층 (SQLAlchemy 2.0). 모든 키는 law_id 기준.
 
-테이블 관계
-  law_catalog  (law_id PK)   전체 현행법령 목록. "무엇이 존재하나" — discovery 가 채움
-    └ 1:1 collect_state(law_id PK)   처리 상태/재처리용 (status·attempts·error·지문)
-    └ 1:1 law(law_id PK)             수집 결과. payload(JSONB) 통째 + 조회용 컬럼
-            └ 1:N law_relation(law_id FK)   relations 정규화 (AI팀 쿼리용)
-  sync_history(law_id)        지문 변경 이력 (감사용)
+Spring 으로 치면 Repository 레이어. 엔티티는 models.py(@Entity), 여기는 그걸 쓰는
+질의/저장 함수. 공개 함수 시그니처는 activities.py 가 그대로 호출하므로 바꾸지 않는다.
 
-조례(ordinance_delegations)는 양이 많아 law.payload JSONB 안에만 보존한다.
+  - engine          : 커넥션 풀 포함(QueuePool). 매 호출 connect 하던 raw 방식 대체
+  - SessionLocal    : 세션 팩토리. `with SessionLocal.begin()` = @Transactional
+  - init_schema     : models.Base 기준으로 테이블/인덱스 생성(없을 때만)
+
+조례(ordinance_delegations)는 양이 많아 law.payload(JSONB) 안에만 보존한다.
 """
 
-import json
 from datetime import datetime, timezone
 
-import psycopg
+from sqlalchemy import create_engine, delete, func, insert, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import sessionmaker
 
 from pipeline.config import DATABASE_URL
+from pipeline.models import (
+    Base, CollectState, Law, LawCatalog, LawRelation, SyncHistory,
+)
 
 
-SCHEMA_STATEMENTS = [
-    # 전체 목록 (현행). discovery 가 페이지네이션으로 채움
-    """
-    CREATE TABLE IF NOT EXISTS law_catalog (
-        law_id            text PRIMARY KEY,   -- 안정적 법령 식별자
-        mst               text,               -- 현행 버전 일련번호
-        law_name          text,
-        law_type          text,               -- 법령구분명 (법률/대통령령/…)
-        ministry          text,               -- 소관부처명
-        enforcement_date  text,
-        promulgation_date text,
-        detail_link       text,
-        version_signature text,               -- 법률+시행령+시행규칙 MST 지문(최신)
-        is_active         boolean DEFAULT true,  -- 폐지되면 false (soft delete)
-        discovered_at     timestamptz,        -- 최초 발견
-        last_seen_at      timestamptz         -- 마지막 목록조회에서 본 시각
-    )
-    """,
-    # 처리 상태 + 변경감지 (재처리의 핵심)
-    """
-    CREATE TABLE IF NOT EXISTS collect_state (
-        law_id            text PRIMARY KEY,
-        law_name          text,
-        status            text,               -- pending | done | failed
-        attempts          int DEFAULT 0,      -- 수집 시도 횟수
-        last_error        text,               -- 마지막 실패 메시지
-        version_signature text,               -- 마지막 MST 지문(변경감지)
-        content_hash      text,               -- 마지막 내용 해시(저장 스킵)
-        last_checked_at   timestamptz,
-        last_collected_at timestamptz,
-        last_changed_at   timestamptz
-    )
-    """,
-    # 수집 결과 본체
-    """
-    CREATE TABLE IF NOT EXISTS law (
-        law_id            text PRIMARY KEY,
-        law_name          text,
-        mst               text,
-        law_type          text,
-        enforcement_date  text,
-        promulgation_date text,
-        is_current        boolean,
-        article_count     int,
-        body_text         text,
-        payload           jsonb NOT NULL,     -- 전체 payload(문서 그대로)
-        content_hash      text,
-        version_signature text,
-        synced_at         timestamptz
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS law_relation (
-        id                bigserial PRIMARY KEY,
-        law_id            text NOT NULL REFERENCES law(law_id) ON DELETE CASCADE,
-        law_name          text,
-        relation_type     text,   -- delegation | citation | internal_ref
-        delegation_type   text,
-        target_category   text,   -- 법령 | 행정규칙 | 자치법규 | 학칙공단
-        source_article_no text,
-        source_clause     text,
-        link_text         text,
-        target_law_name   text,
-        target_article_no text,
-        target_mst        text,
-        target_url        text,
-        resolve_method    text
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_relation_law ON law_relation(law_id)",
-    "CREATE INDEX IF NOT EXISTS idx_relation_target ON law_relation(target_law_name, target_article_no)",
-    "CREATE INDEX IF NOT EXISTS idx_relation_type ON law_relation(relation_type)",
-    "CREATE INDEX IF NOT EXISTS idx_state_status ON collect_state(status)",
-    """
-    CREATE TABLE IF NOT EXISTS sync_history (
-        id            bigserial PRIMARY KEY,
-        law_id        text,
-        law_name      text,
-        changed_at    timestamptz,
-        old_signature text,
-        new_signature text,
-        reason        text
-    )
-    """,
-]
+def _sa_url(url: str) -> str:
+    """psycopg(v3) 드라이버를 쓰도록 SQLAlchemy 방언 접두사를 보정."""
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
+# 커넥션 풀(=HikariCP 역할). pool_pre_ping 으로 끊긴 커넥션 자동 복구.
+engine = create_engine(
+    _sa_url(DATABASE_URL),
+    pool_size=8, max_overflow=4, pool_pre_ping=True, future=True,
+)
+# expire_on_commit=False: 커밋 후에도 객체 속성 접근 가능(세션 밖에서 dict 조립할 때 안전)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 # law_relation 에 넣을 relation dict 키 (law_id/law_name 제외한 본문 필드)
 _RELATION_COLS = [
@@ -114,61 +47,61 @@ _RELATION_COLS = [
 ]
 
 
-def _now():
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _connect():
-    return psycopg.connect(DATABASE_URL, autocommit=True)
-
-
-def init_schema():
-    with _connect() as conn:
-        for stmt in SCHEMA_STATEMENTS:
-            conn.execute(stmt)
+def init_schema() -> None:
+    """models 에 정의된 테이블/인덱스를 생성(이미 있으면 그대로 둠)."""
+    Base.metadata.create_all(engine)
 
 
 # ── 목록(catalog) ────────────────────────────────────────────────
 
 def upsert_catalog(rows: list[dict]) -> dict:
     """
-    목록조회 결과를 law_catalog 에 upsert (지문 포함) + 신규는 collect_state(pending) 생성
-    + 이번 목록에 안 보인 기존 법령은 is_active=false (폐지 soft delete).
+    목록조회 결과를 law_catalog 에 upsert(지문 포함) + 신규는 collect_state(pending) 생성
+    + 이번 목록에 안 보인 기존 법령은 is_active=false(폐지 soft delete).
     반환: {total, new, repealed}
     """
     now = _now()
     new = 0
-    with _connect() as conn:
+    with SessionLocal.begin() as s:
         for r in rows:
-            conn.execute(
-                """
-                INSERT INTO law_catalog (law_id, mst, law_name, law_type, ministry,
-                    enforcement_date, promulgation_date, detail_link, version_signature,
-                    is_active, discovered_at, last_seen_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s)
-                ON CONFLICT (law_id) DO UPDATE SET
-                    mst=EXCLUDED.mst, law_name=EXCLUDED.law_name, law_type=EXCLUDED.law_type,
-                    ministry=EXCLUDED.ministry, enforcement_date=EXCLUDED.enforcement_date,
-                    promulgation_date=EXCLUDED.promulgation_date, detail_link=EXCLUDED.detail_link,
-                    version_signature=EXCLUDED.version_signature, is_active=true,
-                    last_seen_at=EXCLUDED.last_seen_at
-                """,
-                (r["law_id"], r["mst"], r["law_name"], r["law_type"], r["ministry"],
-                 r["enforcement_date"], r["promulgation_date"], r["detail_link"],
-                 r["version_signature"], now, now),
+            cat = pg_insert(LawCatalog).values(
+                law_id=r["law_id"], mst=r["mst"], law_name=r["law_name"],
+                law_type=r["law_type"], ministry=r["ministry"],
+                enforcement_date=r["enforcement_date"], promulgation_date=r["promulgation_date"],
+                detail_link=r["detail_link"], version_signature=r["version_signature"],
+                is_active=True, discovered_at=now, last_seen_at=now,
             )
-            # 신규 법령만 처리 대기열(pending)에 등록 (기존 상태는 유지)
-            cur = conn.execute(
-                """INSERT INTO collect_state (law_id, law_name, status, attempts)
-                   VALUES (%s,%s,'pending',0)
-                   ON CONFLICT (law_id) DO NOTHING""",
-                (r["law_id"], r["law_name"]),
+            cat = cat.on_conflict_do_update(
+                index_elements=[LawCatalog.law_id],
+                set_=dict(
+                    mst=cat.excluded.mst, law_name=cat.excluded.law_name,
+                    law_type=cat.excluded.law_type, ministry=cat.excluded.ministry,
+                    enforcement_date=cat.excluded.enforcement_date,
+                    promulgation_date=cat.excluded.promulgation_date,
+                    detail_link=cat.excluded.detail_link,
+                    version_signature=cat.excluded.version_signature,
+                    is_active=True, last_seen_at=cat.excluded.last_seen_at,
+                ),
             )
-            new += cur.rowcount
+            s.execute(cat)
+
+            # 신규 법령만 처리 대기열(pending)에 등록 (기존 상태는 유지 → 충돌 시 무시)
+            # ON CONFLICT DO NOTHING 은 스킵 시 rowcount 가 -1 이라 신뢰 불가 →
+            # RETURNING 으로 '실제 INSERT 된 행'만 세서 신규 건수를 정확히 집계.
+            cs = pg_insert(CollectState).values(
+                law_id=r["law_id"], law_name=r["law_name"], status="pending", attempts=0,
+            ).on_conflict_do_nothing(index_elements=[CollectState.law_id]).returning(CollectState.law_id)
+            new += len(s.execute(cs).fetchall())   # 삽입=1행 반환, 스킵=0행
+
         # 이번 조회에서 안 보인(=현행 목록에서 사라진) 법령 → 폐지 표시
-        rep = conn.execute(
-            "UPDATE law_catalog SET is_active=false WHERE last_seen_at < %s AND is_active=true",
-            (now,),
+        rep = s.execute(
+            update(LawCatalog)
+            .where(LawCatalog.last_seen_at < now, LawCatalog.is_active.is_(True))
+            .values(is_active=False)
         )
         repealed = rep.rowcount
     return {"total": len(rows), "new": new, "repealed": repealed}
@@ -176,145 +109,150 @@ def upsert_catalog(rows: list[dict]) -> dict:
 
 def list_backfill_targets(limit: int | None = None) -> list[dict]:
     """초기/재처리 대상: 살아있는(active) 법령 중 아직 done 이 아닌 것(pending/failed)."""
-    sql = """
-        SELECT c.law_id, c.law_name, c.version_signature
-        FROM law_catalog c JOIN collect_state s ON s.law_id = c.law_id
-        WHERE c.is_active AND s.status IN ('pending','failed')
-        ORDER BY c.law_name
-    """
+    stmt = (
+        select(LawCatalog.law_id, LawCatalog.law_name, LawCatalog.version_signature)
+        .join(CollectState, CollectState.law_id == LawCatalog.law_id)
+        .where(LawCatalog.is_active.is_(True),
+               CollectState.status.in_(["pending", "failed"]))
+        .order_by(LawCatalog.law_name)
+    )
     if limit:
-        sql += f" LIMIT {int(limit)}"
-    with _connect() as conn:
-        return [{"law_id": r[0], "law_name": r[1], "signature": r[2]}
-                for r in conn.execute(sql).fetchall()]
+        stmt = stmt.limit(int(limit))
+    with SessionLocal() as s:
+        return [{"law_id": a, "law_name": b, "signature": c}
+                for a, b, c in s.execute(stmt)]
 
 
 def list_sync_targets() -> list[dict]:
     """
     변경/미완 대상: 살아있는 법령 중
       - 아직 done 이 아니거나(status != done)
-      - catalog 의 최신 지문이 마지막 수집 지문과 다른 것(=개정됨)
+      - catalog 최신 지문이 마지막 수집 지문과 다른 것(=개정됨)
     catalog 지문(new)과 collect_state 지문(old)을 함께 돌려준다(이력기록용).
     """
-    sql = """
-        SELECT c.law_id, c.law_name, c.version_signature, s.version_signature, s.status
-        FROM law_catalog c LEFT JOIN collect_state s ON s.law_id = c.law_id
-        WHERE c.is_active
-          AND (s.status IS DISTINCT FROM 'done'
-               OR COALESCE(s.version_signature,'') <> COALESCE(c.version_signature,''))
-        ORDER BY c.law_name
-    """
-    with _connect() as conn:
+    stmt = (
+        select(LawCatalog.law_id, LawCatalog.law_name, LawCatalog.version_signature,
+               CollectState.version_signature, CollectState.status)
+        .outerjoin(CollectState, CollectState.law_id == LawCatalog.law_id)
+        .where(
+            LawCatalog.is_active.is_(True),
+            or_(
+                CollectState.status.is_distinct_from("done"),
+                func.coalesce(CollectState.version_signature, "")
+                != func.coalesce(LawCatalog.version_signature, ""),
+            ),
+        )
+        .order_by(LawCatalog.law_name)
+    )
+    with SessionLocal() as s:
         return [{"law_id": r[0], "law_name": r[1], "signature": r[2],
                  "old_signature": r[3], "status": r[4]}
-                for r in conn.execute(sql).fetchall()]
+                for r in s.execute(stmt)]
 
 
 # ── 수집 결과 저장 ───────────────────────────────────────────────
 
-def upsert_law(payload: dict, version_signature: str, content_hash: str):
+def upsert_law(payload: dict, version_signature: str, content_hash: str) -> None:
     """law 1행 upsert + law_relation 통째 교체 (키: law_id)."""
     law_id = str(payload.get("law_id") or "")
     law_name = payload["law_name"]
     body = payload.get("body", {})
-    with _connect() as conn, conn.transaction():
-        conn.execute(
-            """
-            INSERT INTO law (law_id, law_name, mst, law_type, enforcement_date,
-                             promulgation_date, is_current, article_count, body_text,
-                             payload, content_hash, version_signature, synced_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (law_id) DO UPDATE SET
-                law_name=EXCLUDED.law_name, mst=EXCLUDED.mst, law_type=EXCLUDED.law_type,
-                enforcement_date=EXCLUDED.enforcement_date,
-                promulgation_date=EXCLUDED.promulgation_date,
-                is_current=EXCLUDED.is_current, article_count=EXCLUDED.article_count,
-                body_text=EXCLUDED.body_text, payload=EXCLUDED.payload,
-                content_hash=EXCLUDED.content_hash,
-                version_signature=EXCLUDED.version_signature, synced_at=EXCLUDED.synced_at
-            """,
-            (law_id, law_name, payload.get("mst"), payload.get("law_type"),
-             payload.get("enforcement_date"), payload.get("promulgation_date"),
-             payload.get("is_current"), body.get("article_count"), body.get("content"),
-             json.dumps(payload, ensure_ascii=False), content_hash, version_signature, _now()),
+    now = _now()
+    with SessionLocal.begin() as s:
+        stmt = pg_insert(Law).values(
+            law_id=law_id, law_name=law_name, mst=payload.get("mst"),
+            law_type=payload.get("law_type"),
+            enforcement_date=payload.get("enforcement_date"),
+            promulgation_date=payload.get("promulgation_date"),
+            is_current=payload.get("is_current"),
+            article_count=body.get("article_count"), body_text=body.get("content"),
+            payload=payload, content_hash=content_hash,
+            version_signature=version_signature, synced_at=now,
         )
-        # 관계 통째 교체 (law_id 기준)
-        conn.execute("DELETE FROM law_relation WHERE law_id = %s", (law_id,))
-        rows = [
-            tuple([law_id, law_name] + [r.get(c) for c in _RELATION_COLS])
-            for r in payload.get("relations", [])
-        ]
-        if rows:
-            ph = ",".join(["%s"] * (len(_RELATION_COLS) + 2))
-            conn.cursor().executemany(
-                f"INSERT INTO law_relation (law_id, law_name, {','.join(_RELATION_COLS)}) "
-                f"VALUES ({ph})",
-                rows,
-            )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Law.law_id],
+            set_=dict(
+                law_name=stmt.excluded.law_name, mst=stmt.excluded.mst,
+                law_type=stmt.excluded.law_type,
+                enforcement_date=stmt.excluded.enforcement_date,
+                promulgation_date=stmt.excluded.promulgation_date,
+                is_current=stmt.excluded.is_current,
+                article_count=stmt.excluded.article_count,
+                body_text=stmt.excluded.body_text, payload=stmt.excluded.payload,
+                content_hash=stmt.excluded.content_hash,
+                version_signature=stmt.excluded.version_signature,
+                synced_at=stmt.excluded.synced_at,
+            ),
+        )
+        s.execute(stmt)
+
+        # 관계 통째 교체 (law_id 기준) — 삭제 후 일괄 INSERT
+        s.execute(delete(LawRelation).where(LawRelation.law_id == law_id))
+        rels = payload.get("relations", [])
+        if rels:
+            s.execute(insert(LawRelation), [
+                {"law_id": law_id, "law_name": law_name,
+                 **{c: r.get(c) for c in _RELATION_COLS}}
+                for r in rels
+            ])
 
 
 # ── 처리 상태(collect_state) ─────────────────────────────────────
 
 def read_collect_state(law_id: str) -> dict | None:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT status, attempts, version_signature, content_hash "
-            "FROM collect_state WHERE law_id=%s", (law_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return {"status": row[0], "attempts": row[1],
-            "version_signature": row[2], "content_hash": row[3]}
+    with SessionLocal() as s:
+        row = s.get(CollectState, law_id)        # PK 단건 조회(= JPA findById)
+        if not row:
+            return None
+        return {"status": row.status, "attempts": row.attempts,
+                "version_signature": row.version_signature,
+                "content_hash": row.content_hash}
 
 
-def mark_attempt(law_id: str, law_name: str):
+def mark_attempt(law_id: str, law_name: str) -> None:
     """수집 시작 시 호출 — 시도 횟수 +1 (행 없으면 생성)."""
-    with _connect() as conn:
-        conn.execute(
-            """INSERT INTO collect_state (law_id, law_name, status, attempts)
-               VALUES (%s,%s,'pending',1)
-               ON CONFLICT (law_id) DO UPDATE SET attempts = collect_state.attempts + 1,
-                                                   law_name = EXCLUDED.law_name""",
-            (law_id, law_name),
+    with SessionLocal.begin() as s:
+        stmt = pg_insert(CollectState).values(
+            law_id=law_id, law_name=law_name, status="pending", attempts=1)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[CollectState.law_id],
+            set_=dict(attempts=CollectState.attempts + 1,
+                      law_name=stmt.excluded.law_name),
         )
+        s.execute(stmt)
 
 
-def mark_done(law_id: str, version_signature: str, content_hash: str, changed: bool):
+def mark_done(law_id: str, version_signature: str, content_hash: str, changed: bool) -> None:
     now = _now()
-    with _connect() as conn:
-        conn.execute(
-            """UPDATE collect_state SET
-                 status='done', last_error=NULL,
-                 version_signature=%s, content_hash=%s,
-                 last_checked_at=%s, last_collected_at=%s,
-                 last_changed_at=CASE WHEN %s THEN %s ELSE last_changed_at END
-               WHERE law_id=%s""",
-            (version_signature, content_hash, now, now, changed, now, law_id),
+    vals = dict(status="done", last_error=None,
+                version_signature=version_signature, content_hash=content_hash,
+                last_checked_at=now, last_collected_at=now)
+    if changed:                                   # 내용이 바뀐 경우에만 변경시각 갱신
+        vals["last_changed_at"] = now
+    with SessionLocal.begin() as s:
+        s.execute(update(CollectState).where(CollectState.law_id == law_id).values(**vals))
+
+
+def mark_failed(law_id: str, law_name: str, error: str) -> None:
+    with SessionLocal.begin() as s:
+        stmt = pg_insert(CollectState).values(
+            law_id=law_id, law_name=law_name, status="failed", attempts=1,
+            last_error=(error or "")[:2000])
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[CollectState.law_id],
+            set_=dict(status="failed", last_error=stmt.excluded.last_error),
         )
+        s.execute(stmt)
 
 
-def mark_failed(law_id: str, law_name: str, error: str):
-    with _connect() as conn:
-        conn.execute(
-            """INSERT INTO collect_state (law_id, law_name, status, attempts, last_error)
-               VALUES (%s,%s,'failed',1,%s)
-               ON CONFLICT (law_id) DO UPDATE SET status='failed', last_error=EXCLUDED.last_error""",
-            (law_id, law_name, (error or "")[:2000]),
-        )
-
-
-def touch_checked(law_id: str):
-    with _connect() as conn:
-        conn.execute("UPDATE collect_state SET last_checked_at=%s WHERE law_id=%s",
-                     (_now(), law_id))
+def touch_checked(law_id: str) -> None:
+    with SessionLocal.begin() as s:
+        s.execute(update(CollectState).where(CollectState.law_id == law_id)
+                  .values(last_checked_at=_now()))
 
 
 def append_sync_history(law_id: str, law_name: str, old_sig: str | None,
-                        new_sig: str, reason: str):
-    with _connect() as conn:
-        conn.execute(
-            """INSERT INTO sync_history (law_id, law_name, changed_at,
-                                         old_signature, new_signature, reason)
-               VALUES (%s,%s,%s,%s,%s,%s)""",
-            (law_id, law_name, _now(), old_sig, new_sig, reason),
-        )
+                        new_sig: str, reason: str) -> None:
+    with SessionLocal.begin() as s:
+        s.add(SyncHistory(law_id=law_id, law_name=law_name, changed_at=_now(),
+                          old_signature=old_sig, new_signature=new_sig, reason=reason))

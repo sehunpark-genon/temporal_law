@@ -218,6 +218,9 @@ def article_no_from_fields(jo_no, jo_branch) -> str:
     except ValueError:
         return jo_no
 
+    if base == 0:                                # 조문번호 0 = '모든조문'(법령 전체) → 조 없음(법령단위 링크)
+        return ""
+
     if not jo_branch or jo_branch in ("0", "00"):
         return f"제{base}조"
 
@@ -238,18 +241,6 @@ def article_sort_key(article_no: str) -> tuple[int, int]:
     if not match:
         return (10 ** 9, 0)
     return (int(match.group(1)), int(match.group(2) or 0))
-
-
-def jo_no_from_clause(clause: str) -> str:
-    """
-    조항호목 문자열(예: '제2조제10호', '제18조의8제5항')에서 제N조(의M) 부분만 추출.
-    법제처 조문 단축 URL은 '조' 단위까지만 인식하므로 항/호/목은 떼어낸다.
-    """
-    if not clause:
-        return ""
-
-    match = re.match(r"(제\d+조(?:의\d+)?)", clause)
-    return match.group(1) if match else ""
 
 
 # =========================
@@ -481,16 +472,6 @@ def normalize_delegation_type(raw, link_text: str, target_title: str) -> str:
     return "시행령"
 
 
-# 위임구분 -> 캐노니컬 URL 카테고리
-DELEGATION_CATEGORY = {
-    "시행령": "법령",
-    "시행규칙": "법령",
-    "위임행정규칙": "행정규칙",
-    "위임자치법규": "자치법규",
-    "위임학칙공단": "학칙공단",
-}
-
-
 def _source_article_no(article_info: dict) -> str:
     """조정보(이 법령의 조문)에서 제N조(의M) 생성."""
     if not isinstance(article_info, dict):
@@ -502,10 +483,29 @@ def _source_article_no(article_info: dict) -> str:
 
 
 def _rel_from_law_target(wi: dict, source_article_no: str) -> list[dict]:
-    """위임법령(시행령/시행규칙) -> relations."""
-    title = normalize_text(wi.get("위임법령제목", ""))
-    target_mst = str(wi.get("위임법령일련번호", "") or "")
+    """위임법령(시행령/시행규칙) -> relations.
+
+    한 위임블록(wi)의 '위임법령제목'·'위임법령일련번호'가 한 조문이 여러 규칙에
+    위임할 때 **리스트**로 온다(예: 같은 규칙의 현행/구버전, 서로 다른 규칙 여럿).
+    그대로 str() 하면 "['규칙A','규칙B']" 로 뭉개지므로, 제목 기준으로 분리해
+    (제목, MST) 쌍마다 relation 을 만든다.
+    """
     raw_type = wi.get("위임구분")
+
+    # (제목, MST) 쌍 — 제목 기준 중복 제거(같은 규칙이 중복으로 오는 경우), 첫 MST 유지
+    titles = listify(wi.get("위임법령제목"))
+    msts = listify(wi.get("위임법령일련번호"))
+    pairs = []
+    seen = set()
+    for i, t in enumerate(titles):
+        t = normalize_text(t)
+        if not t or t in seen:               # 빈 제목/중복 제목은 건너뜀
+            continue
+        seen.add(t)
+        pairs.append((t, str(msts[i]) if i < len(msts) else ""))
+
+    # 대상 규칙이 둘 이상이면 어느 규칙의 몇 조인지 귀속이 모호 → 법령단위 링크로 둔다
+    multi = len(pairs) > 1
 
     out = []
     for jo in listify(wi.get("위임법령조문정보")):
@@ -513,28 +513,28 @@ def _rel_from_law_target(wi: dict, source_article_no: str) -> list[dict]:
             continue
 
         link_text = normalize_text(jo.get("링크텍스트", ""))
-        deleg_type = normalize_delegation_type(raw_type, link_text, title)
-
-        target_article_no = article_no_from_fields(
+        article_no = article_no_from_fields(
             jo.get("위임법령조문번호", ""),
             jo.get("위임법령조문가지번호", ""),
         )
 
-        out.append({
-            "relation_type": "delegation",
-            "delegation_type": deleg_type,
-            "target_category": "법령",
-            "source_article_no": source_article_no,
-            "source_clause": normalize_text(jo.get("조항호목", "")),
-            "link_text": link_text,
-            "line_text": normalize_text(jo.get("라인텍스트", "")),
-            "target_law_name": title,
-            "target_article_no": target_article_no,
-            "target_article_title": normalize_text(jo.get("위임법령조문제목", "")),
-            "target_mst": target_mst,
-            "target_url": build_ref_url("법령", title, target_article_no or None),
-            "resolve_method": "lsDelegated",
-        })
+        for title, target_mst in pairs:
+            target_article_no = "" if multi else article_no
+            out.append({
+                "relation_type": "delegation",
+                "delegation_type": normalize_delegation_type(raw_type, link_text, title),
+                "target_category": "법령",
+                "source_article_no": source_article_no,
+                "source_clause": normalize_text(jo.get("조항호목", "")),
+                "link_text": link_text,
+                "line_text": normalize_text(jo.get("라인텍스트", "")),
+                "target_law_name": title,
+                "target_article_no": target_article_no,
+                "target_article_title": "" if multi else normalize_text(jo.get("위임법령조문제목", "")),
+                "target_mst": target_mst,
+                "target_url": build_ref_url("법령", title, target_article_no or None),
+                "resolve_method": "lsDelegated",
+            })
     return out
 
 

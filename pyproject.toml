@@ -1,0 +1,17 @@
+[project]
+name = "temporal-law"
+version = "0.1.0"
+description = "법제처 현행법령 수집·적재 파이프라인 (본문 + 하이퍼링크 메타 + Temporal/Postgres)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "requests",
+    "temporalio",
+    "psycopg[binary]",
+    "SQLAlchemy>=2.0",
+]
+
+[tool.uv]
+# 앱(스크립트) 형태로만 쓰고 자체 패키지 빌드는 안 함.
+# collector/ · pipeline/ 는 레포 루트에서 `python -m ...` 로 임포트.
+package = false
