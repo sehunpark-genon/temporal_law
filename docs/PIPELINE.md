@@ -1,161 +1,125 @@
-# 적재 파이프라인 (Temporal + Postgres)
+# 적재 파이프라인 (운영)
 
-전체 현행법령 목록을 카탈로그로 적재하고, 그 카탈로그를 기준으로 법령별 수집·적재·변경감지를 자동화한다. 결과는 전용 **Postgres `lawdb`** 에 적재 → AI팀이 DB 로 소비.
+법제처 현행 시행 법령을 **discover(목록) → backfill(초기 전량) → sync(매일 변경분)** 3단계로 자동 수집·적재한다. 결과는 전용 **Postgres `lawdb`** 에 쌓이고 AI팀이 DB 로 소비 OR JSON 파일 제공
 
-> 전체 흐름은 [OVERVIEW.md](OVERVIEW.md), 본문·하이퍼링크 추출 로직은 [COLLECTION.md](COLLECTION.md) 참고. 이 문서는 "전체 목록을 받아 어떻게 자동으로 돌리고 적재·갱신하나".
+> 수집 로직(본문·하이퍼링크를 어떻게 뽑나) → [COLLECTION.md](COLLECTION.md) · DB 테이블·컬럼 → [ERD.md](ERD.md) · 실행/환경변수 → [README](../README.md)
 
 ---
 
-## 1. 디렉터리 구조
+## 1. 큰 그림
 
+```mermaid
+flowchart TD
+    API(["법제처 API<br/>eflaw = 오늘 시행 중 목록"]) --> D["discover<br/>전체 목록 → law_catalog<br/>지문 계산 · 신규/폐지 표시"]
+    D --> B["backfill (1회)<br/>catalog 의 미수집분 전량 수집"]
+    D -->|매일| S["sync<br/>목록 새로고침 → 지문 바뀐 것만 재수집"]
+    B --> DB[("law · law_relation<br/>= payload")]
+    S --> DB
+    DB --> AI(["AI팀 소비"])
 ```
-collector/            ← 수집 코어 (pipeline 이 이걸 호출)
-  core.py             본문+위임+인용+자기참조+정렬 → payload   (구 main.py)
-  render.py           Chrome 렌더링 + 정관 해석
-  verify.py           커버리지 검증
 
-pipeline/             ← 적재 자동화 (Temporal). collector 를 사용
-  config.py           .env 설정 + 카탈로그 옵션(법률만/배치크기)
-  collect.py          어댑터: discover_catalog(전체목록+지문)·collect_payload·content_hash
-  models.py           ORM 엔티티 (SQLAlchemy 2.0) — law_catalog / collect_state / law / law_relation / sync_history
-  db.py               저장 계층(Repository): 엔진(커넥션 풀) + upsert/조회 함수
-  activities.py       I/O(목록·네트워크·Chrome·DB)를 Temporal Activity 로 격리
-  workflows.py        오케스트레이션 (워크플로 4개)
-  worker.py           워커
-  starter.py          CLI: discover / backfill / sync-now / schedule / unschedule
-
-pyproject.toml        의존성/프로젝트 정의 (uv) · uv.lock 로 버전 고정
-docker-compose.yml    temporal-db · temporal · temporal-ui · lawdb
-```
-**의존 방향**: `pipeline` → `pipeline.collect` → `collector.core` → `collector.render`.
-**DB 계층**: `models.py`(@Entity 격) + `db.py`(Repository 격). SQLAlchemy 2.0 ORM, 엔진에 커넥션 풀 내장. `init_schema()` 가 `models.Base` 기준으로 테이블/인덱스 생성(없을 때만).
+- **discover** 가 "무슨 법이 있나"(catalog)를 채우고 각 법의 변경감지 **지문**을 계산한다.
+- **backfill** 은 그 catalog 를 보고 아직 안 받은 법을 전량 수집(처음 한 번).
+- **sync** 는 매일 discover 를 다시 돌려 **지문이 바뀐 법만** 재수집한다.
 
 ---
 
 ## 2. 워크플로 (4개)
 
-```
-DiscoverCatalogWorkflow(law_only)            전체 목록 조회 → law_catalog 적재 (신규는 처리대기 등록)
-CollectLawWorkflow(law_name, law_id, sig)    공용 단위: 한 법령 [수집→저장] (멱등)
-├─ BackfillWorkflow(limit)                   카탈로그 기준 배치 수집 (초기적재 & 재처리, limit 생략=전체)
-└─ SyncWorkflow()                            (스케줄) 카탈로그 전체 MST 지문 비교 → 바뀐 것만 재수집
-```
-- 실제 I/O 는 전부 **activity** 로 격리(워크플로는 결정적이어야 함). activity 는 워커가 ThreadPoolExecutor 로 실행.
-- **데이터 흐름**: `discover`(목록) → `law_catalog` → `backfill`(법령별 수집) → `law`/`law_relation`, 이후 `sync`(매일 변경분만).
+| 워크플로 | 언제 | 하는 일 |
+|---|---|---|
+| **DiscoverCatalogWorkflow** | `discover` / `sync` 앞단 | 전체 목록(`eflaw nw=3`) 조회 → `law_catalog` 적재 (신규 `pending`·폐지 `is_active=false`·지문 갱신) |
+| **CollectLawWorkflow**(name, id, sig) | backfill·sync 내부 **공용 단위** | 한 법령 [수집→저장] (멱등, 재시도·`content_hash` 스킵 포함) |
+| **BackfillWorkflow**([N]) | 초기적재 / 재처리 | catalog 의 `pending`·`failed` 를 배치로 CollectLaw |
+| **SyncWorkflow**() | 매일 스케줄 | discover → 지문 바뀐 것만 CollectLaw → 이력 기록 |
+
+> 워크플로는 **결정적 오케스트레이션만** 담당하고, 실제 I/O(네트워크·Chrome·DB)는 전부 **activity** 로 격리해 워커의 스레드풀에서 실행한다. 수집 후엔 공통으로 **검증·알림**(#5)이 붙는다.
 
 ---
 
-## 3. 재처리(이어받기) — 부하·실패에 강하게
+## 3. 초기적재 — `discover` + `backfill`
 
-- **Temporal 자동 재시도**: 네트워크/일시 오류는 activity RetryPolicy 가 자동 재시도(지수 백오프).
-- **법령별 실패 격리**: 한 법령이 끝까지 실패해도 `collect_state.status='failed'` 로 기록하고 **나머지는 계속** 진행.
-- **이어받기**: `backfill` 은 `status IN (pending, failed)` 만 대상으로 한다. 중간에 죽거나 일부 실패해도 **다시 `backfill` 하면 안 끝난 것만** 재처리. `attempts` 로 시도 횟수 추적.
-- **배치**: `BACKFILL_BATCH`(기본 20) 단위로 병렬 → 동시 부하 / Temporal 히스토리 제어.
-- **호출 간격**: `get_json` 이 호출마다 0.2s 슬립 → 과호출 방지. (본문/lsDelegated 는 법령당 1회씩)
-
----
-
-## 4. 변경 감지 (MST 지문)
-
-- `discover_catalog` 가 전체 목록을 받을 때 **법령 + 시행령 + 시행규칙의 MST** 를 묶어 `_signature_for` 로 **지문(signature)** 생성 → `law_catalog.version_signature` 에 저장.
-- `sync` 가 catalog 의 최신 지문과 `collect_state` 의 마지막 수집 지문을 비교 → 다르면 재수집.
-- `content_hash`(payload 내용 SHA-256)는 별개로, 수집 후 **내용이 같으면 DB 쓰기를 스킵**하는 보조 값.
-
----
-
-## 5. DB 스키마 (`lawdb`)
+"명단 만들기(discover) → 명단에서 안 끝난 것만 배치로 수집(backfill) → 실패는 격리하고 이어받기"
 
 ```mermaid
-erDiagram
-    law_catalog ||--|| collect_state : law_id
-    law_catalog ||--o| law           : law_id
-    law         ||--o{ law_relation  : law_id
-    law         ||--o{ sync_history  : history
+flowchart TD
+    D["discover<br/>law_catalog 채움 (신규→pending)"] --> T["list_backfill_targets<br/>status = pending 또는 failed"]
+    T --> B["20개씩 배치 병렬"]
+    B --> C["CollectLaw 단위"]
+    C --> R{"수집 성공?"}
+    R -->|일시오류| RT["Temporal 자동 재시도<br/>지수 백오프"]
+    RT --> C
+    R -->|끝내 실패| F["failed 기록 · 나머지 계속"]
+    R -->|성공| H{"content_hash 같나?"}
+    H -->|다름| W["law · law_relation 저장"]
+    H -->|같음| SK["DB 쓰기 스킵"]
 ```
-| 테이블 | 역할 |
-|---|---|
-| `law_catalog` | 전체 현행법령 목록 "무엇이 존재하나" — discover 가 채움 |
-| `collect_state` | 법령별 처리 상태/재처리 (status·attempts·error·지문) |
-| `law` | 수집 결과. payload(JSONB) + 조회용 컬럼 |
-| `law_relation` | `payload.relations` 정규화 (SQL 쿼리 편의용) |
-| `sync_history` | 지문 변경 이력 (감사용) |
-> 조례(`ordinance_delegations`)는 양이 많아 `law.payload` JSONB 안에만 보존.
 
-### `law_catalog` — 명단 ("무슨 법이 있나")
-| 필드 | 값 예시 | 용도 |
-|---|---|---|
-| `law_id` (PK) | `001234` | 법령 고유 식별자(버전 바뀌어도 동일) |
-| `mst` | `279697` | 현행 버전 일련번호(개정되면 바뀜) |
-| `law_name` / `law_type` / `ministry` | `장애인복지법` / `법률` / `보건복지부` | 메타 |
-| `enforcement_date` / `promulgation_date` | `20260512` | 시행일 / 공포일 |
-| `detail_link` | `/DRF/lawService.do?...` | 법제처 원본 링크 |
-| `version_signature` | `0014023d6e007816` | **법률+시행령+시행규칙 MST 지문**(변경 감지 기준) |
-| `is_active` | `true` / `false` | 현행이면 true, **폐지되면 false** |
-| `discovered_at` / `last_seen_at` | 시각 | 최초 발견 / 마지막 목록조회에서 본 시각 |
-
-### `collect_state` — 처리 상태 ("어디까지 했나")
-| 필드 | 값 예시 | 용도 |
-|---|---|---|
-| `law_id` (PK) | `001234` | 어떤 법 |
-| `status` | `pending`/`done`/`failed` | 수집 상태 |
-| `attempts` | `2` | 수집 시도 횟수 |
-| `last_error` | `Child Workflow ...` | 마지막 실패 사유 |
-| `version_signature` | `0014...` | **마지막 수집 시점의 지문**(catalog 지문과 비교) |
-| `content_hash` | `595ccf...` | 마지막 저장 내용 해시(같으면 재저장 스킵) |
-| `last_checked_at` / `last_collected_at` / `last_changed_at` | 시각 | 확인 / 수집 / 실제변경 시각 |
-
-### `law` — 수집 결과 본체
-| 필드 | 값 예시 | 용도 |
-|---|---|---|
-| `law_id` (PK), `law_name`, `mst`, `law_type` | … | 식별/메타 |
-| `enforcement_date`, `promulgation_date`, `is_current` | … | 메타 |
-| `article_count` | `196` | 조문 수(검증용) |
-| `body_text` | `"제1조(목적) …"` | 본문 전체 텍스트 |
-| **`payload`** (JSONB) | `{ … }` | **전체 결과 문서. AI팀은 이것만 주면 충분** (형식 → COLLECTION.md) |
-| `content_hash`, `version_signature`, `synced_at` | … | 변경 판정 값 / 저장 시각 |
-
-### `law_relation` — 관계 정규화
-`payload.relations` 를 행으로 펼친 사본. `relation_type`·`target_category`·`source_article_no`·`target_law_name`·`target_url` 등 컬럼 → **"이 법이 인용/위임하는 것만 골라 SQL 조회"** 용. (payload 안에도 같은 내용 존재)
-
-### `sync_history` — 변경 이력
-`law_id`·`changed_at`·`old_signature`·`new_signature`·`reason`(initial/mst_changed).
-
-```sql
-SELECT status, count(*) FROM collect_state GROUP BY status;        -- 진행 현황
-SELECT * FROM law_relation WHERE law_name='장애인복지법' AND relation_type='delegation';
-SELECT * FROM collect_state WHERE status='failed';                 -- 실패(재처리 대상)
-SELECT law_name FROM law_catalog WHERE NOT is_active;              -- 폐지된 법
-```
+**재처리(이어받기)가 강한 이유**
+- **자동 재시도**: 네트워크/일시 오류는 activity `RetryPolicy` 가 지수 백오프로 재시도. API 호출도 자체 백오프(4xx는 재시도 안 함).
+- **빈 데이터 방지**: 검색/본문이 비면 `CollectError` 로 명확히 실패 → 빈 payload 가 `done` 으로 굳지 않음.
+- **실패 격리**: 한 법령이 끝내 실패해도 `status='failed'` 기록 후 **나머지는 계속**.
+- **이어받기**: `backfill` 은 `pending`·`failed` 만 대상. 다시 돌리면 **안 끝난 것만** 재처리(`attempts` 로 횟수 추적).
+- **배치·간격**: `LAW_BACKFILL_BATCH`(기본 20) 병렬 + 호출 간 0.2s → 과호출/히스토리 제어.
 
 ---
 
-## 6. 실행
+## 4. 매일 동기 — `sync`
 
-### 6-1. `.env`
-```ini
-LAW_API_OC=발급받은_OC_키                                       # 필수
-TEMPORAL_ADDRESS=localhost:7233
-DATABASE_URL=postgresql://lawuser:lawpass@localhost:5544/lawdb
-# 선택: 전체(시행령·규칙 포함) 목록까지 받으려면
-# LAW_CATALOG_LAW_ONLY=false
+"목록 새로고침(discover) → 지문 바뀐 것만 재수집 → 이력 기록"
+
+```mermaid
+flowchart TD
+    S(["매일 sync (스케줄)"]) --> D["① discover (refresh_catalog)<br/>eflaw nw=3 전체 목록"]
+    D --> U["신규→pending · 폐지→is_active=false<br/>지문 갱신"]
+    U --> L["② list_sync_targets<br/>catalog 지문 ≠ 마지막 수집 지문"]
+    L --> C["변경분만 CollectLaw"]
+    C --> H{"content_hash 같나?"}
+    H -->|다름| WR["저장 + last_changed_at"]
+    H -->|같음| SKP["DB 쓰기 스킵"]
+    C --> REC["sync_history 이력 기록"]
 ```
 
-### 6-2. 순서
-```bash
-# 의존성 (uv.lock 기준 .venv 동기화)
-uv sync
+### 변경 감지는 2단 게이트 — 1단 "재수집할지", 2단 "DB에 쓸지"
 
-# 인프라
-docker compose up -d            # 새 머신은 전체 / 이 PC는: docker compose up -d lawdb
+1. **`version_signature`** (목록 비교 · 가벼움): 법+시행령+시행규칙의 **(MST + 시행일)** 해시. catalog 최신 지문 ≠ 마지막 수집 지문이면 재수집. (전체 sweep ≈ 56콜, 본문 재수집은 바뀐 법만)
+   - **왜 시행일까지?** *공포* 는 MST 변경으로 잡히지만, 이미 공포된 개정의 *시행 도래*(같은 MST, 시행일만 advance)는 MST 만으론 못 잡는다. eflaw 현행 시행일이 그 전환 때 advance → 시행일까지 넣어야 감지된다.
+2. **`content_hash`** (내용 비교 · 재수집 후): payload 내용 해시가 이전과 **같으면 `law` 쓰기 스킵**(지문은 바뀌었지만 내용은 그대로) → 확인시각만 갱신.
 
-# 워커 상주 (터미널 1, 정관 Chrome 사용)
-uv run python -m pipeline.worker
+### 지문과 무관하게 자동 처리
+- **폐지** — 전체 목록에 안 보이면 `last_seen_at` 미갱신 → `is_active=false`(soft delete, 데이터 보존).
+- **시행령/규칙 단독 변경** — 부모 법률 지문에 (령·규칙 MST·시행일이) 포함 → 부모 법률 재수집 → 위임 링크 자동 갱신.
 
-# 적재 (터미널 2)
-uv run python -m pipeline.starter discover    # ① 전체 목록 → law_catalog (법률 1,714건; 'discover all' = 전체)
-uv run python -m pipeline.starter backfill     # ② 미처리/실패 법령 수집 (몇 번 돌려도 안 끝난 것만 이어받음)
-uv run python -m pipeline.starter backfill 5   #    테스트: 5건만
-uv run python -m pipeline.starter schedule     # ③ 매일 자동 sync 등록 (sync-now / unschedule 도 있음)
-```
+---
 
---
+## 5. 수집 후 — 검증 · 알림 (공통)
+
+### 커버리지 검증 (`verify_run`)
+수집한 payload 가 본문 하이퍼링크를 다 담았는지 **Chrome ground-truth 와 대조**. 초기적재/동기가 **다른 옵션**을 쓴다(env, 최선 노력 — 실패해도 워크플로를 막지 않음):
+
+| env | 시점 | 값 (기본) |
+|---|---|---|
+| `LAW_VERIFY_BACKFILL` | 초기적재 후 | `off` / `random:N` / `all` (기본 `random:3` 표본) |
+| `LAW_VERIFY_SYNC` | 동기 후 | `off` / `changed` / `all` (기본 `changed` = 이번에 바뀐 것 전부) |
+
+독립 실행(수동 검증)도 가능 — 명령은 [README](../README.md#실행).
+
+### 완료 알림 (`notify`)
+`backfill`/`sync` 끝나면 대상/완료/실패/신규/폐지 + 검증 요약을 **Slack**(웹훅 설정 시) 또는 **macOS 데스크톱**으로. 미설정이면 조용히 패스.
+
+---
+
+## 6. 운영 한계
+
+변경 감지는 "가볍게 전체 목록을 받아 지문 비교"에 기대는데, **대상마다 그 목록이 있느냐**가 갈린다.
+
+| 대상 | 전체 목록 | 버전 추적 |
+|---|---|---|
+| 본 법 + 시행령 + 시행규칙 | ✅ 목록에 다 나옴 | ✅ catalog 지문(MST+시행일)으로 추적 |
+| 인용 대상(형법·민법 등 법률) | ✅ 목록에 나옴 | ✅ catalog 가 폐지·개명을 감지 |
+| **조례(자치법규)** | ❌ 별도·수만 건 | ⚠️ **부모 법 통해서만** |
+| **정관(학칙공단)** | ❌ 목록 API 없음 | ⚠️ **부모 법 통해서만** |
+
+- **조례·정관은 `version_signature` 에 안 들어간다.** 부모 법(법/령/규칙)이 안 바뀌면, 그 법이 위임한 조례·정관이 **단독으로 추가·삭제·제목변경돼도 sync 가 못 잡는다.**
+  - 단, 우리가 저장하는 건 *내용* 이 아니라 **제목+링크** 라 대상의 *내용* 변경은 무관(링크가 최신 가리킴). 실제 문제는 "제목 변경 / 추가·삭제"뿐.
+- **보완책(현재 A):** ⒜ 부모 MST 변경 시 재수집(적용) / ⒝ 조례·정관 보유 법만 주기적 강제 재수집(미적용) / ⒞ 조례 일련번호로 개별 확인(무겁고 정관엔 API 없음).

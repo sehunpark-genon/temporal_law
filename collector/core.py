@@ -2,11 +2,14 @@ import os
 import re
 import json
 import time
+import logging
 from datetime import datetime, timezone, timedelta
 
 import requests
 
 from collector import render
+
+logger = logging.getLogger("collector.core")
 
 
 # =========================
@@ -23,7 +26,11 @@ def load_dotenv(path: str = ".env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+            value = value.strip()
+            # 따옴표로 감싸지 않은 값의 인라인 주석( ' #' 뒤)은 제거
+            if value[:1] not in ("'", '"'):
+                value = re.split(r"\s+#", value, 1)[0].strip()
+            os.environ.setdefault(key.strip(), value.strip("\"'"))
 
 
 load_dotenv()
@@ -35,6 +42,11 @@ BASE_URL = "http://www.law.go.kr/DRF"
 
 # 사용자 이동용 캐노니컬 URL (한글 그대로, 퍼센트 인코딩 X)
 LAWGO = "https://www.law.go.kr"
+
+
+class CollectError(Exception):
+    """수집 실패(검색·본문 조회 실패 등). 빈 payload 를 조용히 저장하지 않고
+    명확히 실패시켜 파이프라인이 재시도/실패기록을 하도록 한다."""
 
 # PoC니까 3개만
 LAW_NAMES = [
@@ -50,6 +62,17 @@ RAW_DIR = os.path.join(OUTPUT_DIR, "raw")
 KST = timezone(timedelta(hours=9))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() not in ("false", "0", "no", "")
+
+
+# 로컬 파일 저장 토글 (env 로 on/off)
+#  - LAW_SAVE_RAW     : search/body/delegated 원본 응답을 output/raw/ 에 저장 (기본 on)
+#  - LAW_SAVE_PAYLOAD : 최종 payload 를 output/ 에 저장 (기본 off — 파이프라인은 DB 적재라 불필요)
+SAVE_RAW = _env_bool("LAW_SAVE_RAW", True)
+SAVE_PAYLOAD = _env_bool("LAW_SAVE_PAYLOAD", False)
+
+
 # =========================
 # 1. 공통 유틸
 # =========================
@@ -63,35 +86,56 @@ def ensure_dirs():
 
 
 def save_json(path: str, data):
+    """JSON 저장. 상위 폴더가 없으면 만든다(ensure_dirs 호출 여부와 무관하게 안전)."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def get_json(url: str, params: dict, sleep_sec: float = 0.2):
+def _safe_params(params: dict) -> dict:
+    """로그에 OC(인증키)가 찍히지 않도록 마스킹."""
+    return {k: ("***" if k == "OC" else v) for k, v in (params or {}).items()}
+
+
+def get_json(url: str, params: dict, sleep_sec: float = 0.2, retries: int = 3):
     """
     법제처 API 호출 공통 함수.
-    PoC라서 단순 retry만 넣음.
+
+    - 일시 오류(네트워크/5xx/타임아웃)는 지수 백오프로 재시도(1s→2s→4s, 상한 5s)
+    - 4xx(잘못된 요청)는 재시도해도 무의미하므로 즉시 중단
+    - 호출 사이 sleep_sec 간격 유지(과호출 방지)
+    - 최종 실패 시 None 반환(상위에서 빈 데이터를 'done' 으로 저장하지 않도록 CollectError 로 승격)
+    - 로그에는 OC(인증키)를 절대 남기지 않는다(_safe_params)
     """
-    for attempt in range(3):                      # 최대 3회 재시도
+    last_err = None
+    for attempt in range(retries):
         try:
             res = requests.get(url, params=params, timeout=30)
             res.raise_for_status()
-
             text = res.text.strip()
-            if not text:                          # 빈 응답이면 None
+            if not text:                          # 빈 응답
                 return None
-
             return res.json()
 
-        except Exception as e:
-            if attempt == 2:                      # 마지막 시도까지 실패 → 포기
-                print(f"[ERROR] API 실패: {url} params={params} err={e}")
+        except requests.HTTPError as e:
+            last_err = e
+            status = getattr(e.response, "status_code", 0)
+            if 400 <= status < 500:               # 잘못된 요청 → 재시도 무의미
+                logger.warning("API %s (재시도 안 함): %s params=%s",
+                               status, url, _safe_params(params))
                 return None
+        except Exception as e:                    # 네트워크/타임아웃/JSON 등
+            last_err = e
 
-            time.sleep(1)                         # 재시도 전 대기
+        if attempt < retries - 1:                 # 마지막 시도가 아니면 백오프 후 재시도
+            time.sleep(min(2 ** attempt, 5))
+        time.sleep(sleep_sec)                     # 호출 간 최소 간격
 
-        finally:
-            time.sleep(sleep_sec)                 # 호출 간 최소 간격(과호출 방지)
+    logger.error("API 실패(%d회 시도): %s params=%s err=%s",
+                 retries, url, _safe_params(params), last_err)
+    return None
 
 
 def normalize_text(text: str) -> str:
@@ -249,14 +293,19 @@ def article_sort_key(article_no: str) -> tuple[int, int]:
 
 def search_law(law_name: str) -> dict:
     """
-    법령명으로 법령 목록 검색.
-    여기서 law_id, mst, 공포일자, 시행일자 등을 최대한 가져옴.
+    법령명으로 '현행 시행 중' 버전을 검색 (target=eflaw, nw=3).
+    여기서 law_id, mst, 공포일자, 시행일자 등을 가져온다.
+
+    target=law(현행법령)는 공포된 최신본(미래 시행 조문 포함)을 주는 반면,
+    target=eflaw + nw=3(현행 시행일법령)은 '오늘 실제 시행 중'인 버전을 준다.
+    (이 MST·시행일을 fetch_law_body 의 eflaw 조회 키로 그대로 사용)
     """
     url = f"{BASE_URL}/lawSearch.do"
     params = {
         "OC": OC,
-        "target": "law",
+        "target": "eflaw",
         "type": "JSON",
+        "nw": "3",                 # 현행(오늘 시행 중)만
         "query": law_name,
     }
 
@@ -264,7 +313,8 @@ def search_law(law_name: str) -> dict:
     if not data:
         return {}
 
-    save_json(os.path.join(RAW_DIR, f"{law_name}_search.json"), data)
+    if SAVE_RAW:
+        save_json(os.path.join(RAW_DIR, f"{law_name}_search.json"), data)
 
     # 응답 구조가 LawSearch.law 형태일 때가 많음
     laws = []
@@ -318,15 +368,31 @@ def _attach_key(params: dict, law_meta: dict, law_name: str) -> dict:
 
 
 def fetch_law_body(law_meta: dict, law_name: str) -> dict:
-    """현행 법령 본문 조회 (JSON)."""
+    """
+    '오늘 시행 중' 본문 조회 (target=eflaw, 시행일 기준).
+
+    target=eflaw 는 그 시행일(efYd) 시점에 효력 있는 본문만 준다(미래 시행 조문 제외).
+    efYd 는 반드시 '그 법의 현행 시행일'(존재하는 시행일)이어야 한다 — 오늘 날짜처럼
+    해당 시행일이 없는 값을 주면 빈 결과가 오므로, 매칭 실패 시 efYd 없이 재시도한다.
+    """
     url = f"{BASE_URL}/lawService.do"
-    params = _attach_key({"OC": OC, "target": "law", "type": "JSON"}, law_meta, law_name)
+    ef_yd = str(law_meta.get("시행일자") or law_meta.get("시행일") or "")
+    params = _attach_key({"OC": OC, "target": "eflaw", "type": "JSON"}, law_meta, law_name)
+    if ef_yd:
+        params["efYd"] = ef_yd
 
     data = get_json(url, params)
+
+    # efYd 가 실제 시행일과 안 맞아 빈 본문이 오면 efYd 없이 재시도(현행 시행본 반환)
+    if "efYd" in params and not first_value_recursive(data or {}, ["조문단위"]):
+        params.pop("efYd")
+        data = get_json(url, params)
+
     if not data:
         return {}
 
-    save_json(os.path.join(RAW_DIR, f"{law_name}_body.json"), data)
+    if SAVE_RAW:
+        save_json(os.path.join(RAW_DIR, f"{law_name}_body.json"), data)
     return data
 
 
@@ -349,7 +415,8 @@ def fetch_delegated(law_meta: dict, law_name: str) -> dict:
     if not data:
         return {}
 
-    save_json(os.path.join(RAW_DIR, f"{law_name}_delegated.json"), data)
+    if SAVE_RAW:
+        save_json(os.path.join(RAW_DIR, f"{law_name}_delegated.json"), data)
     return data
 
 
@@ -369,7 +436,9 @@ def extract_article_text(jo: dict) -> str:
     if not isinstance(jo, dict):
         return ""
 
-    head = normalize_text(jo.get("조문내용", ""))  # 조 제목/머리글 (예: "제2조(정의) …")
+    # 조문/항/호/목 '내용' 은 법령에 따라 문자열·리스트·리스트의 리스트로 와서
+    # flatten_text 로 평탄화한 뒤 정규화한다(안 하면 "[['...']]" 가 그대로 박힘).
+    head = normalize_text(flatten_text(jo.get("조문내용", "")))  # 조 제목/머리글
     if head:
         parts.append(head)
 
@@ -377,7 +446,7 @@ def extract_article_text(jo: dict) -> str:
         if not isinstance(hang, dict):
             continue
 
-        hang_text = normalize_text(hang.get("항내용", ""))
+        hang_text = normalize_text(flatten_text(hang.get("항내용", "")))
         if hang_text:
             parts.append(hang_text)
 
@@ -385,14 +454,13 @@ def extract_article_text(jo: dict) -> str:
             if not isinstance(ho, dict):
                 continue
 
-            ho_text = normalize_text(ho.get("호내용", ""))
+            ho_text = normalize_text(flatten_text(ho.get("호내용", "")))
             if ho_text:
                 parts.append(ho_text)
 
             for mok in listify(ho.get("목")):     # 목(가.나.…) 순회
                 if not isinstance(mok, dict):
                     continue
-                # 목내용은 문자열/리스트/리스트의 리스트로 옴 → 평탄화해서 한 줄로
                 mok_text = normalize_text(flatten_text(mok.get("목내용", "")))
                 if mok_text:
                     parts.append(mok_text)
@@ -400,32 +468,59 @@ def extract_article_text(jo: dict) -> str:
     return "\n".join(parts)                       # 조문 내 줄들을 \n 으로
 
 
-def build_body_text(body_json: dict) -> str:
-    """법령 본문 JSON -> 조문 순서를 유지한 텍스트."""
-    units = first_value_recursive(body_json, ["조문단위"])
-    units = listify(units)
+# 편/장/절/관 표제 (조문여부 != '조문' 인 구조 헤더). 예: "제1장 총칙"
+_CHAPTER_RE = re.compile(r"^제\d+\s*[편장절관]")
 
-    blocks = []
-    seen = set()
+
+def build_articles(body_json: dict) -> list[dict]:
+    """
+    본문 JSON 을 '조 단위' 리스트로 만든다. (search 팀이 본문을 재파싱하지 않도록)
+    각 원소 = { article_no, article_title, chapter, content, relations(빈 배열) }.
+
+    - 실제 조문(조문여부=='조문')만 단위로 만든다.
+    - 편/장/절/관 표제(조문여부=='전문' 등)는 단위로 만들지 않고, 직전 '장'을
+      기억해 뒤따르는 조문의 chapter 로 붙인다(원문 구조 보존).
+    - relations 는 호출부에서 source_article_no 기준으로 채워 넣는다.
+    """
+    units = listify(first_value_recursive(body_json, ["조문단위"]))
+
+    articles = []
+    seen = set()                                  # 중복 조문번호 방지(첫 항목 유지)
+    current_chapter = ""
 
     for jo in units:
-        text = extract_article_text(jo)
-        if not text:
+        if not isinstance(jo, dict):
             continue
 
-        key = compact(text)
-        if key in seen:
+        # 조문 여부 판정: '조문' 이거나(표시 없을 때) 조문제목/항이 있으면 조문으로 본다
+        is_article = (jo.get("조문여부") == "조문") or (
+            not jo.get("조문여부") and (jo.get("조문제목") or jo.get("항"))
+        )
+
+        head = normalize_text(flatten_text(jo.get("조문내용", "")))
+
+        if not is_article:                        # 편/장/절/관 표제면 현재 장 갱신만
+            if _CHAPTER_RE.match(head):
+                current_chapter = head
             continue
 
-        seen.add(key)
-        blocks.append(text)
+        article_no = article_no_from_fields(jo.get("조문번호", ""), jo.get("조문가지번호", ""))
+        if not article_no or article_no in seen:
+            continue
+        content = extract_article_text(jo)
+        if not content:
+            continue
 
-    return "\n\n".join(blocks)
+        seen.add(article_no)
+        articles.append({
+            "article_no": article_no,
+            "article_title": normalize_text(jo.get("조문제목", "")),
+            "chapter": current_chapter,
+            "content": content,
+            "relations": [],                      # 호출부에서 채움
+        })
 
-
-def count_articles(body_text: str) -> int:
-    """대충 제N조 패턴으로 조문 개수 추정."""
-    return len(re.findall(r"제\d+조(?:의\d+)?\s*\(", body_text))
+    return articles
 
 
 # =========================
@@ -639,10 +734,67 @@ def _hang_no(hang_label) -> int | None:
     return _CIRCLED_NUM.get(label[:1]) if label else None
 
 
+# 호/목 '내용' 맨 앞의 번호 라벨. API의 호번호 필드는 가지번호(1의2,4의2)를 안 주고
+# base 만 주는 경우가 많아( '4의2' 도 '4.' 로 옴 ), 실제 가지번호는 내용 앞에서 파싱한다.
+_HO_PREFIX = re.compile(r"^\s*(\d+(?:의\d+)?)\s*\.")
+_MOK_PREFIX = re.compile(r"^\s*([가-힣])\s*\.")
+
+
+def _ho_label(ho_no) -> str:
+    """호번호 '4.' -> '제4호', '4의2.' -> '제4호의2'."""
+    s = str(ho_no or "").strip().rstrip(".").strip()
+    if not s:
+        return ""
+    if "의" in s:
+        base, _, branch = s.partition("의")
+        return f"제{base.strip()}호의{branch.strip()}"
+    return f"제{s}호"
+
+
+def _ho_label_of(ho: dict) -> str:
+    """호 단위의 라벨. 내용 앞('4의2.')을 우선 파싱하고, 없으면 호번호 필드로 폴백."""
+    m = _HO_PREFIX.match(normalize_text(flatten_text(ho.get("호내용", ""))))
+    return _ho_label(m.group(1) if m else ho.get("호번호", ""))
+
+
+def _mok_label(mok_no) -> str:
+    """목번호 '가.' -> '가목'."""
+    s = str(mok_no or "").strip().rstrip(".").strip()
+    return f"{s}목" if s else ""
+
+
+def _mok_label_of(mok: dict) -> str:
+    """목 단위의 라벨. 내용 앞('가.')을 우선 파싱하고, 없으면 목번호 필드로 폴백."""
+    m = _MOK_PREFIX.match(normalize_text(flatten_text(mok.get("목내용", ""))))
+    return _mok_label(m.group(1) if m else mok.get("목번호", ""))
+
+
+# 조항호목 문자열에서 (항, 호, 호가지, 목) 순번을 뽑아 정렬용 튜플로.
+_MOK_ORDER = {chr(c): i for i, c in enumerate(range(ord("가"), ord("힣") + 1))}
+
+
+def clause_sort_key(article_no: str, rel: dict) -> tuple:
+    """
+    한 조(條) 안에서 relation 을 '본문 등장 순서(항→호→목)'로 정렬하기 위한 키.
+    source_clause(예: '제2조제1항제4호의2', 위임의 '제2조제10호')에서 항/호/목 순번 파싱.
+    파싱 안 되는 부분은 0(=앞쪽)으로 둬서 조 머리글·항 없는 항목이 먼저 오게 한다.
+    """
+    clause = rel.get("source_clause") or article_no or ""
+    hang = re.search(r"제(\d+)항", clause)
+    ho = re.search(r"제(\d+)호(?:의(\d+))?", clause)
+    mok = re.search(r"([가-힣])목", clause)
+    return (
+        int(hang.group(1)) if hang else 0,
+        int(ho.group(1)) if ho else 0,
+        int(ho.group(2)) if (ho and ho.group(2)) else 0,
+        _MOK_ORDER.get(mok.group(1), 0) if mok else 0,
+    )
+
+
 def iter_citation_lines(body_json: dict):
     """
-    본문 JSON 을 (출처조문, 출처항, 라인텍스트) 단위로 펼친다.
-    인용이 본문 '어디(몇 조 몇 항)'에 있는지 추적하기 위함.
+    본문 JSON 을 (출처조문, 출처조항호목, 라인텍스트) 단위로 펼친다.
+    인용이 본문 '어디(몇 조 몇 항 몇 호)'에 있는지 호·목 단위까지 추적한다.
     """
     for jo in listify(first_value_recursive(body_json, ["조문단위"])):
         if not isinstance(jo, dict):
@@ -650,7 +802,7 @@ def iter_citation_lines(body_json: dict):
 
         art = article_no_from_fields(jo.get("조문번호", ""), jo.get("조문가지번호", ""))
 
-        head = normalize_text(jo.get("조문내용", ""))
+        head = normalize_text(flatten_text(jo.get("조문내용", "")))
         if head:
             yield art, art, head  # 조문 본문(제목+제1항 inline 등)
 
@@ -658,23 +810,25 @@ def iter_citation_lines(body_json: dict):
             if not isinstance(hang, dict):
                 continue
             hno = _hang_no(hang.get("항번호", ""))
-            clause = f"{art}제{hno}항" if (art and hno) else art
+            hang_clause = f"{art}제{hno}항" if (art and hno) else art
 
-            ht = normalize_text(hang.get("항내용", ""))
+            ht = normalize_text(flatten_text(hang.get("항내용", "")))
             if ht:
-                yield art, clause, ht
+                yield art, hang_clause, ht
 
             for ho in listify(hang.get("호")):
                 if not isinstance(ho, dict):
                     continue
-                hot = normalize_text(ho.get("호내용", ""))
+                ho_clause = hang_clause + _ho_label_of(ho)   # 호 단위(가지번호 포함)
+                hot = normalize_text(flatten_text(ho.get("호내용", "")))
                 if hot:
-                    yield art, clause, hot
+                    yield art, ho_clause, hot
                 for mok in listify(ho.get("목")):
                     if isinstance(mok, dict):
+                        mok_clause = ho_clause + _mok_label_of(mok)
                         mt = normalize_text(flatten_text(mok.get("목내용", "")))
                         if mt:
-                            yield art, clause, mt
+                            yield art, mok_clause, mt
 
 
 def build_citation_relations(body_json: dict, self_law_name: str | None = None) -> list[dict]:
@@ -892,16 +1046,24 @@ def dedupe_relations(relations: list[dict]) -> list[dict]:
 # 7. payload 생성
 # =========================
 
-def build_payload(law_name: str) -> dict:
-    """법령 1건의 전체 payload 조립 (수집 코어의 진입점)."""
-    print(f"\n[START] {law_name}")
+def build_payload(law_name: str, law_meta: dict | None = None) -> dict:
+    """
+    법령 1건의 전체 payload 조립 (수집 코어의 진입점).
 
-    law_meta = search_law(law_name)               # ① 검색: MST·ID·날짜 등 메타
+    law_meta:
+      - None  → 이름으로 직접 검색(search_law). '검증/단독 실행' 경로.
+      - dict  → catalog 가 이미 받아둔 메타(MST·시행일 등)를 재사용. '파이프라인' 경로
+                (법마다 search 를 또 호출하는 중복 제거).
+    """
+    logger.info("[START] %s", law_name)
+
+    if law_meta is None:                          # ① (검증/단독) 이름으로 검색
+        law_meta = search_law(law_name)
 
     body_json = fetch_law_body(law_meta, law_name)        # ② 본문 (JSON)
     delegated_json = fetch_delegated(law_meta, law_name)  # ③ 위임링크 (lsDelegated)
 
-    body_text = build_body_text(body_json)        # ④ 본문 → 조문 순서 텍스트
+    articles = build_articles(body_json)          # ④ 본문 → 조 단위 리스트
 
     law_id = (
         law_meta.get("ID")
@@ -916,6 +1078,13 @@ def build_payload(law_name: str) -> dict:
         or first_value_recursive(body_json, ["법령일련번호", "MST"])
         or ""
     )
+
+    # ── 수집 실패 가드: 빈 payload 를 조용히 'done' 으로 저장하지 않는다 ──
+    # (검색·본문 조회가 일시 실패하면 여기서 raise → 파이프라인이 재시도/실패기록)
+    if not str(mst) and not str(law_id):
+        raise CollectError(f"법령 메타 조회 실패(검색 결과 없음): {law_name}")
+    if not articles:
+        raise CollectError(f"본문 조회 실패(조문 0건): {law_name} (mst={mst})")
 
     law_type = (
         law_meta.get("법령구분명")
@@ -974,6 +1143,19 @@ def build_payload(law_name: str) -> dict:
     relations.sort(key=lambda r: article_sort_key(r.get("source_article_no", "")))
     ordinance_delegations.sort(key=lambda r: article_sort_key(r.get("source_article_no", "")))
 
+    # ⑦ relations 를 '조 단위'로 그룹핑해 각 조 안에 넣는다.
+    #    (조례=위임자치법규는 한 조에 수백 건이라 노이즈 → body 밖 별도 배열로 유지)
+    by_src: dict[str, list] = {}
+    for rel in relations:
+        by_src.setdefault(rel.get("source_article_no", ""), []).append(rel)
+    for art in articles:
+        rels = by_src.pop(art["article_no"], [])
+        # 조 안에서는 '본문 등장 순서(항→호→목)'로 정렬 (타입순 X)
+        rels.sort(key=lambda r: clause_sort_key(art["article_no"], r))
+        art["relations"] = rels
+    # 어느 조에도 매칭되지 않은 relations(출처조문 미상 등) — 보통 비어 있음
+    unmatched = [r for rs in by_src.values() for r in rs]
+
     # 카테고리별 / 관계유형별 카운트 (검증/요약용)
     by_category = {}
     by_relation_type = {}
@@ -982,6 +1164,14 @@ def build_payload(law_name: str) -> dict:
         by_relation_type[rel["relation_type"]] = by_relation_type.get(rel["relation_type"], 0) + 1
 
     ordinance_doc_total = sum(g["ordinance_count"] for g in ordinance_delegations)
+
+    body = {
+        "format": "articles",                     # 조 단위 구조 (이전: 단일 텍스트)
+        "article_count": len(articles),
+        "articles": articles,                     # [{article_no, article_title, chapter, content, relations[]}]
+    }
+    if unmatched:                                 # 매칭 실패분이 있으면 별도 보존
+        body["unmatched_relations"] = unmatched
 
     payload = {
         "law_id": str(law_id),
@@ -994,18 +1184,15 @@ def build_payload(law_name: str) -> dict:
         "revision_date": str(revision_date),
         "is_current": True,
 
-        "body": {
-            "format": "text",
-            "content": body_text,
-            "article_count": count_articles(body_text),
-        },
-
-        "relations": relations,
-        "ordinance_delegations": ordinance_delegations,
+        "body": body,
+        "ordinance_delegations": ordinance_delegations,   # 조례: 조별 묶음(별도 배열)
         "relation_stats": {
             "relations_total": len(relations),
             "by_category": by_category,
             "by_relation_type": by_relation_type,
+            "articles_total": len(articles),
+            "articles_with_relations": sum(1 for a in articles if a["relations"]),
+            "unmatched_relations": len(unmatched),
             "ordinance_groups": len(ordinance_delegations),
             "ordinance_docs_total": ordinance_doc_total,
         },
@@ -1021,15 +1208,21 @@ def build_payload(law_name: str) -> dict:
         },
     }
 
-    print(f"[DONE] {law_name}")
-    print(f"  - body_length: {len(body_text)}")
-    print(f"  - relations: {len(relations)}  by_type={by_relation_type}")
-    print(f"  - 조례(위임자치법규): {len(ordinance_delegations)}개 조문 / 조례 {ordinance_doc_total}건")
+    logger.info("[DONE] %s | 조문 %d(관계보유 %d) · relations %d %s 미매칭 %d · 조례 %d조문/%d건",
+                law_name, len(articles), payload["relation_stats"]["articles_with_relations"],
+                len(relations), by_relation_type, len(unmatched),
+                len(ordinance_delegations), ordinance_doc_total)
+
+    if SAVE_PAYLOAD:                              # 옵션: 최종 payload 로컬 저장
+        save_json(os.path.join(OUTPUT_DIR, f"{law_name}_payload.json"), payload)
 
     return payload
 
 
 def main():
+    # CLI 단독 실행 시 로그가 보이도록 기본 설정 (워커는 자체 설정 사용)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
+
     if not OC:
         raise SystemExit(
             "환경변수 LAW_API_OC 가 비어 있습니다.\n"
@@ -1039,26 +1232,29 @@ def main():
 
     ensure_dirs()
 
-    payloads = []
-
+    payloads, failed = [], []
     for law_name in LAW_NAMES:
-        payload = build_payload(law_name)
+        try:
+            payload = build_payload(law_name)
+        except CollectError as e:                  # 한 건 실패해도 나머지는 계속
+            logger.warning("[SKIP] %s: %s", law_name, e)
+            failed.append(law_name)
+            continue
         payloads.append(payload)
-        # 법령별 개별 파일도 저장 (단건으로 보기 편하게)
+        # CLI 는 파일 산출이 목적이라 개별 payload 도 항상 저장
         save_json(os.path.join(OUTPUT_DIR, f"{law_name}_payload.json"), payload)
 
     save_json(os.path.join(OUTPUT_DIR, "laws_payload.json"), payloads)
-
-    # PoC 상태 파일
-    state = {
+    save_json(os.path.join(OUTPUT_DIR, "state.json"), {
         "total": len(payloads),
+        "failed": failed,
         "law_names": LAW_NAMES,
         "synced_at": now_kst(),
         "output_file": "output/laws_payload.json",
-    }
-    save_json(os.path.join(OUTPUT_DIR, "state.json"), state)
+    })
 
-    print("\n[SUCCESS] output/laws_payload.json 생성 완료")
+    logger.info("[SUCCESS] %d건 저장(실패 %d) → output/laws_payload.json",
+                len(payloads), len(failed))
 
 
 if __name__ == "__main__":

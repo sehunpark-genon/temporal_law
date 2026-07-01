@@ -37,6 +37,8 @@ async def main():
                 activities.collect_and_store,
                 activities.mark_failed,
                 activities.record_change,
+                activities.notify,
+                activities.verify_run,
             ],
             activity_executor=executor,
         )

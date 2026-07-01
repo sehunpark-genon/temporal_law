@@ -157,6 +157,11 @@ def upsert_law(payload: dict, version_signature: str, content_hash: str) -> None
     law_id = str(payload.get("law_id") or "")
     law_name = payload["law_name"]
     body = payload.get("body", {})
+    articles = body.get("articles", [])
+    # 조 단위 구조 → 조회용 body_text(전체 본문)·law_relation(평면 relations) 파생
+    body_text = "\n\n".join(a.get("content", "") for a in articles)
+    rels = [r for a in articles for r in a.get("relations", [])] \
+        + body.get("unmatched_relations", [])
     now = _now()
     with SessionLocal.begin() as s:
         stmt = pg_insert(Law).values(
@@ -165,7 +170,7 @@ def upsert_law(payload: dict, version_signature: str, content_hash: str) -> None
             enforcement_date=payload.get("enforcement_date"),
             promulgation_date=payload.get("promulgation_date"),
             is_current=payload.get("is_current"),
-            article_count=body.get("article_count"), body_text=body.get("content"),
+            article_count=body.get("article_count"), body_text=body_text,
             payload=payload, content_hash=content_hash,
             version_signature=version_signature, synced_at=now,
         )
@@ -186,9 +191,8 @@ def upsert_law(payload: dict, version_signature: str, content_hash: str) -> None
         )
         s.execute(stmt)
 
-        # 관계 통째 교체 (law_id 기준) — 삭제 후 일괄 INSERT
+        # 관계 통째 교체 (law_id 기준) — 삭제 후 일괄 INSERT (조별 relations 를 평면화)
         s.execute(delete(LawRelation).where(LawRelation.law_id == law_id))
-        rels = payload.get("relations", [])
         if rels:
             s.execute(insert(LawRelation), [
                 {"law_id": law_id, "law_name": law_name,
@@ -198,6 +202,17 @@ def upsert_law(payload: dict, version_signature: str, content_hash: str) -> None
 
 
 # ── 처리 상태(collect_state) ─────────────────────────────────────
+
+def read_catalog(law_id: str) -> dict | None:
+    """catalog 단건 조회 — 수집 시 search 재호출 없이 MST·시행일을 재사용하기 위함."""
+    with SessionLocal() as s:
+        row = s.get(LawCatalog, law_id)
+        if not row:
+            return None
+        return {"law_id": row.law_id, "mst": row.mst, "law_type": row.law_type,
+                "ministry": row.ministry, "enforcement_date": row.enforcement_date,
+                "promulgation_date": row.promulgation_date}
+
 
 def read_collect_state(law_id: str) -> dict | None:
     with SessionLocal() as s:

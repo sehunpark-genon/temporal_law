@@ -18,7 +18,9 @@ from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from pipeline import activities
-    from pipeline.config import CATALOG_LAW_ONLY, BACKFILL_BATCH
+    from pipeline.config import (
+        CATALOG_LAW_ONLY, BACKFILL_BATCH, VERIFY_BACKFILL, VERIFY_SYNC,
+    )
 
 
 _SHORT = dict(start_to_close_timeout=timedelta(seconds=30),
@@ -29,11 +31,23 @@ _COLLECT = dict(start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=3))
 _PERSIST = dict(start_to_close_timeout=timedelta(minutes=2),
                 retry_policy=RetryPolicy(maximum_attempts=5))
+# 검증은 Chrome 렌더라 느리고 '최선 노력'이라 재시도 안 함
+_VERIFY = dict(start_to_close_timeout=timedelta(minutes=30),
+               retry_policy=RetryPolicy(maximum_attempts=1))
 
 
 def _chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def _verify_note(verify: dict) -> str:
+    """검증 결과를 알림 문구 꼬리표로. (검증 안 했으면 빈 문자열)"""
+    if not verify or verify.get("checked", 0) == 0:
+        return ""
+    bad = verify.get("failed") or []
+    tail = f" ({', '.join(bad[:3])})" if bad else ""
+    return f" · 검증 {verify['passed']}/{verify['checked']} 통과{tail}"
 
 
 @workflow.defn
@@ -98,7 +112,22 @@ class BackfillWorkflow:
 
         run_id = workflow.info().run_id[:8]
         done, failed = await _collect_batches(targets, run_id, "collect")
-        return {"targets": len(targets), "done": len(done), "failed": failed}
+        result = {"targets": len(targets), "done": len(done), "failed": failed}
+
+        # 수집 후 커버리지 검증(초기적재 옵션: 기본 random:3 표본)
+        verify = await workflow.execute_activity(
+            activities.verify_run,
+            args=[[t["law_name"] for t in done], VERIFY_BACKFILL], **_VERIFY)
+        result["verify"] = verify
+
+        # 완료 알림(Slack 미설정 시 no-op)
+        await workflow.execute_activity(
+            activities.notify,
+            f"[backfill] 대상 {len(targets)} · 완료 {len(done)} · 실패 {len(failed)}"
+            + (f" ({', '.join(failed[:5])})" if failed else "")
+            + _verify_note(verify),
+            **_SHORT)
+        return result
 
 
 @workflow.defn
@@ -129,5 +158,21 @@ class SyncWorkflow:
                     args=[t["law_id"], t["law_name"], t.get("old_signature"),
                           t.get("signature"), reason], **_SHORT)
 
-        return {"catalog": cat, "to_collect": len(targets),
-                "done": len(done), "failed": failed}
+        result = {"catalog": cat, "to_collect": len(targets),
+                  "done": len(done), "failed": failed}
+
+        # 수집 후 커버리지 검증(동기 옵션: 기본 changed = 이번에 바뀐 것만 전부)
+        verify = await workflow.execute_activity(
+            activities.verify_run,
+            args=[[t["law_name"] for t in done], VERIFY_SYNC], **_VERIFY)
+        result["verify"] = verify
+
+        # 완료 알림(Slack 미설정 시 no-op): 신규/폐지/변경 요약
+        await workflow.execute_activity(
+            activities.notify,
+            f"[sync] 신규 {cat.get('new', 0)} · 폐지 {cat.get('repealed', 0)} · "
+            f"변경수집 {len(done)}/{len(targets)} · 실패 {len(failed)}"
+            + (f" ({', '.join(failed[:5])})" if failed else "")
+            + _verify_note(verify),
+            **_SHORT)
+        return result

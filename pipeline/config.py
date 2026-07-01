@@ -34,3 +34,13 @@ CATALOG_LAW_ONLY = os.environ.get("LAW_CATALOG_LAW_ONLY", "true").lower() != "fa
 
 # backfill 시 한 번에 병렬 수집할 법령 수(부하/Temporal 히스토리 제어)
 BACKFILL_BATCH = int(os.environ.get("LAW_BACKFILL_BATCH", "20"))
+
+# Slack 알림 (선택). 비어 있으면 알림 비활성(파이프라인은 정상 동작)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+# 수집 후 커버리지 검증(Chrome ground-truth 대조)을 워크플로에 통합.
+#  - VERIFY_BACKFILL: 초기적재 후  →  off | random:N | all      (기본 random:3, 방금 수집한 것 중 표본)
+#  - VERIFY_SYNC    : 매일 동기 후  →  off | changed | all       (기본 changed = 이번에 바뀐 것만 전부)
+# 검증은 '최선 노력'이라 실패해도 워크플로를 막지 않는다.
+VERIFY_BACKFILL = os.environ.get("LAW_VERIFY_BACKFILL", "random:3")
+VERIFY_SYNC = os.environ.get("LAW_VERIFY_SYNC", "changed")

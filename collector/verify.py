@@ -19,16 +19,52 @@
   - 같은/타 법령의 '제N조' 조문링크 -> 문서간 참조가 아니라 조문 네비게이션(별도 집계)
 """
 
+import os
 import re
 import json
+import logging
+import argparse
 
 import requests
 
 from collector import render as R
 from collector.core import OUTPUT_DIR, build_ref_url
 
+logger = logging.getLogger("collector.verify")
 
-def load_payloads() -> list[dict]:
+
+def load_payloads(mode: str = "random", n: int = 3,
+                  names: list[str] | None = None) -> list[dict]:
+    """
+    검증할 payload 목록을 DB(law.payload)에서 가져온다.
+      - names 지정  → 그 법령들
+      - mode=all    → 적재된 전체 (무거움)
+      - mode=random → 랜덤 N개 (스팟체크)
+      - mode=changed→ 최근 n일 내 갱신된 것만 (초기적재/갱신 후 '바뀐 것만' 검증용)
+    파일로 검증하려면 load_from_file() 사용.
+    """
+    # verify 는 '검증 도구'라, DB 의존은 여기서만 지연 임포트한다.
+    from pipeline import db
+    from pipeline.models import Law, CollectState
+    from sqlalchemy import select, func
+
+    with db.SessionLocal() as s:
+        stmt = select(Law.payload)
+        if names:
+            stmt = stmt.where(Law.law_name.in_(list(names)))
+        elif mode == "all":
+            stmt = stmt.order_by(Law.law_name)
+        elif mode == "changed":
+            stmt = (stmt.join(CollectState, CollectState.law_id == Law.law_id)
+                    .where(CollectState.last_changed_at
+                           >= func.now() - func.make_interval(0, 0, 0, n)))
+        else:  # random
+            stmt = stmt.order_by(func.random()).limit(n)
+        return [row[0] for row in s.execute(stmt)]
+
+
+def load_from_file() -> list[dict]:
+    """(레거시) output/laws_payload.json 에서 로드 — CLI 단발 수집 결과 검증용."""
     with open(f"{OUTPUT_DIR}/laws_payload.json", encoding="utf-8") as f:
         return json.load(f)
 
@@ -101,7 +137,10 @@ def check_law(law: dict) -> bool:
     gt = render_ground_truth(law)
     print("  렌더링 앵커 분포:", gt["_anchor_counts"])
 
-    relations = law["relations"]
+    # 조 단위 구조: 각 조의 relations 를 평면화해서 검증
+    _body = law.get("body", {})
+    relations = [r for a in _body.get("articles", []) for r in a.get("relations", [])] \
+        + _body.get("unmatched_relations", [])
     ordinances = law.get("ordinance_delegations", [])
 
     # payload 측 집합
@@ -191,7 +230,10 @@ def spot_check_addresses(payloads, sample_per_category=2) -> bool:
 
     by_cat: dict[str, list] = {}
     for law in payloads:
-        for r in law["relations"]:
+        _body = law.get("body", {})
+        _rels = [r for a in _body.get("articles", []) for r in a.get("relations", [])] \
+            + _body.get("unmatched_relations", [])
+        for r in _rels:
             by_cat.setdefault(r["target_category"], []).append(r["target_url"])
         for g in law.get("ordinance_delegations", []):
             for o in g.get("ordinances", [])[:1]:
@@ -217,23 +259,54 @@ def spot_check_addresses(payloads, sample_per_category=2) -> bool:
 
 
 def main():
-    payloads = load_payloads()
+    ap = argparse.ArgumentParser(
+        description="법령 payload 커버리지 검증 (본문 하이퍼링크 누락/주소 유효성). "
+                    "payload 는 DB(law) 에서 읽는다.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true", help="적재된 전체 법령 검증(무거움)")
+    g.add_argument("--random", type=int, metavar="N", help="랜덤 N개 스팟체크 (기본 3)")
+    g.add_argument("--changed", type=int, nargs="?", const=1, metavar="DAYS",
+                   help="최근 DAYS일 내 갱신된 법령만 (기본 1일) — 초기적재/갱신 후 '바뀐 것만' 검증")
+    ap.add_argument("names", nargs="*", help="특정 법령명(들) 직접 지정")
+    ap.add_argument("--no-addr", action="store_true", help="주소 유효성 표본검사 생략(빠름)")
+    ap.add_argument("--file", action="store_true", help="DB 대신 output/laws_payload.json 에서 읽기")
+    args = ap.parse_args()
 
-    results = []
-    for law in payloads:
-        results.append(check_law(law))
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s | %(message)s")
 
-    addr_ok = spot_check_addresses(payloads)
+    if args.file:
+        payloads = load_from_file()
+    elif args.names:
+        payloads = load_payloads(names=args.names)
+    elif args.all:
+        payloads = load_payloads(mode="all")
+    elif args.changed is not None:
+        payloads = load_payloads(mode="changed", n=args.changed)
+    elif args.random is not None:
+        payloads = load_payloads(mode="random", n=args.random)
+    else:  # CLI 옵션 없으면 env 기본값 (LAW_VERIFY_MODE / LAW_VERIFY_N)
+        mode = os.environ.get("LAW_VERIFY_MODE", "random")
+        n = int(os.environ.get("LAW_VERIFY_N", "3"))
+        payloads = load_payloads(mode="all") if mode == "all" else load_payloads(mode=mode, n=n)
+
+    if not payloads:
+        print("검증할 payload 가 없습니다. (DB 적재 여부/조건 확인)")
+        return
+
+    print(f"검증 대상: {len(payloads)}건")
+    results = [check_law(law) for law in payloads]
+    addr_ok = True if args.no_addr else spot_check_addresses(payloads)
 
     print("\n" + "=" * 72)
     print("최종 결과")
     print("=" * 72)
     for law, ok in zip(payloads, results):
         print(f"  {'✅ PASS' if ok else '❌ FAIL'}  {law['law_name']}")
-    print(f"  {'✅ PASS' if addr_ok else '❌ FAIL'}  주소 유효성 표본")
+    if not args.no_addr:
+        print(f"  {'✅ PASS' if addr_ok else '❌ FAIL'}  주소 유효성 표본")
 
     if all(results) and addr_ok:
-        print("\n🎉 모든 본문 하이퍼링크(외부참조)가 payload 에 캡처되었고 주소도 유효합니다.")
+        print("\n🎉 검증 대상의 본문 하이퍼링크가 모두 payload 에 캡처되었습니다.")
     else:
         print("\n⚠️  누락 또는 무효 주소가 있습니다. 위 리포트를 확인하세요.")
 
